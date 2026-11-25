@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenFOAM Boundary Conditions</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --text: #1f2328; --muted: #6a737d;
+  --border: #e1e4e8; --accent: #0b6e99; --accent-bg: #e6f3f8;
+  --req: #c0392b; --code-bg: #f3f4f6; --chip: #eef1f4; --sel: #dbeef6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171a; --panel: #1d2024; --text: #e6e6e6; --muted: #9aa4ae;
+    --border: #2d3238; --accent: #5cc3ec; --accent-bg: #173340;
+    --req: #ff7b6b; --code-bg: #121416; --chip: #262a2f; --sel: #1f3a47;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171a; --panel: #1d2024; --text: #e6e6e6; --muted: #9aa4ae;
+  --border: #2d3238; --accent: #5cc3ec; --accent-bg: #173340;
+  --req: #ff7b6b; --code-bg: #121416; --chip: #262a2f; --sel: #1f3a47;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+code, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12.5px; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+  border-bottom: 1px solid var(--border); background: var(--panel); }
+header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+header .meta { color: var(--muted); font-size: 12px; }
+header button { margin-left: auto; }
+button { background: var(--chip); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 3px 9px; cursor: pointer; font: inherit; font-size: 12px; }
+button:hover { border-color: var(--accent); }
+.layout { display: grid; grid-template-columns: 360px 1fr; height: calc(100% - 49px); }
+aside { border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; background: var(--panel); }
+.controls { padding: 10px; border-bottom: 1px solid var(--border); }
+#q { width: 100%; padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); color: var(--text); font: inherit; }
+#q:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.chip { font-size: 11.5px; padding: 1px 8px; border-radius: 10px; }
+.chip.on { background: var(--accent); color: var(--panel); border-color: var(--accent); }
+.opts { margin-top: 6px; font-size: 12px; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
+#list { overflow-y: auto; flex: 1; margin: 0; padding: 0; list-style: none; }
+#list li { padding: 7px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
+#list li:hover { background: var(--accent-bg); }
+#list li.sel { background: var(--sel); }
+#list .n { font-weight: 600; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+#list .s { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { font-size: 10px; padding: 0 5px; border-radius: 4px; background: var(--chip);
+  color: var(--muted); margin-left: 4px; vertical-align: 1px; }
+.count { padding: 6px 12px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); }
+main { overflow-y: auto; padding: 20px 28px 60px; min-width: 0; }
+main h2 { margin: 0 0 4px; font-size: 22px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+main h3 { font-size: 14px; margin: 22px 0 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.sub { color: var(--muted); font-size: 12.5px; }
+.desc { white-space: pre-wrap; }
+.codebox { position: relative; }
+.codebox pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px 14px; overflow-x: auto; margin: 0; }
+.codebox button { position: absolute; top: 6px; right: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+td.k { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: nowrap; }
+tr.req td.k { color: var(--req); font-weight: 600; }
+.tablewrap { overflow-x: auto; }
+.theading { font-weight: 600; margin: 12px 0 4px; }
+ul.paths { margin: 0; padding-left: 18px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+details summary { cursor: pointer; color: var(--accent); }
+.empty { color: var(--muted); margin-top: 40px; }
+@media (max-width: 760px) {
+  .layout { grid-template-columns: 1fr; height: auto; }
+  aside { max-height: 45vh; }
+  main { padding: 16px; }
+}
+.tabs { display: flex; gap: 6px; margin-left: 16px; }
+.tabs button.on { background: var(--accent); color: var(--panel); border-color: var(--accent); }
+.warn { color: var(--req); font-weight: 600; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; font-size: 13px; }
+.kv div:nth-child(odd) { color: var(--muted); }
+.bar { display: inline-block; height: 8px; background: var(--accent); border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+.roles { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
+.role { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.role h4 { margin: 0 0 6px; font-size: 13px; }
+.role table td { padding: 2px 4px; border: 0; }
+.role a { color: var(--accent); cursor: pointer; text-decoration: none; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
+select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font: inherit; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OpenFOAM boundary conditions</h1>
+  <div class="tabs"><button id="tabCat" class="on">Catalog</button><button id="tabTyp">Typical per field</button></div>
+  <span class="meta" id="meta"></span>
+  <button id="theme" title="Toggle theme">Theme</button>
+</header>
+<div class="layout" id="catalog">
+  <aside>
+    <div class="controls">
+      <input id="q" type="search" placeholder="Search name, description, parameter, 日本語... (/)" autocomplete="off">
+      <div class="chips" id="chips"></div>
+      <div class="opts">
+        <label><input type="checkbox" id="optT"> used in tutorials</label>
+        <label><input type="checkbox" id="optP"> point fields</label>
+        <label>value type <select id="optV"><option value="">any</option><option>scalar</option><option>vector</option><option>symmTensor</option><option>tensor</option></select></label>
+      </div>
+    </div>
+    <ul id="list"></ul>
+    <div class="count" id="count"></div>
+  </aside>
+  <main id="detail"><p class="empty">Select a boundary condition. Entries go into the <code>boundaryField</code> of the field files in <code>0/</code>.</p></main>
+</div>
+<div id="typical" style="display:none; padding: 20px 28px 60px; overflow-y: auto; height: calc(100% - 49px);">
+  <p>Field <select id="fieldSel"></select>
+  <span class="sub">Most common boundary conditions in the tutorials for each patch role (the role is guessed from the patch name, e.g. "inlet", "outlet", "wall").</span></p>
+  <div class="roles" id="roles"></div>
+  <h3>Recipes (all fields of one patch at once)</h3>
+  <div id="recipes"></div>
+</div>
+<script>
+const DB = /*__BC_DATA__*/null;
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+let group = "All", current = null, kind = "fv";
+const all = () => Object.values(DB[kind]);
+
+document.getElementById("meta").textContent =
+  `${DB.version} · ${Object.keys(DB.fv).length} fv + ${Object.keys(DB.point).length} point boundary conditions · built ${DB.built}`;
+
+const root = document.documentElement;
+try { const t = localStorage.getItem("bcTheme"); if (t) root.dataset.theme = t; } catch (e) {}
+document.getElementById("theme").onclick = () => {
+  const dark = root.dataset.theme ? root.dataset.theme === "dark"
+    : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("bcTheme", root.dataset.theme); } catch (e) {}
+};
+
+function buildChips() {
+  const groups = ["All", ...[...new Set(all().map(e => e.group))].sort()];
+  if (!groups.includes(group)) group = "All";
+  const chips = document.getElementById("chips");
+  chips.innerHTML = "";
+  groups.forEach(g => {
+    const b = document.createElement("button");
+    b.className = "chip" + (g === group ? " on" : ""); b.textContent = g;
+    b.onclick = () => { group = g; [...chips.children].forEach(c => c.classList.toggle("on", c === b)); render(); };
+    chips.appendChild(b);
+  });
+}
+
+function haystack(e) {
+  return (e.name + " " + e.description + " " + e.header + " " + (e.aliases || "") + " " + e.tags.join(" ") + " " +
+    Object.keys(e.fields).join(" ") + " " + e.tables.flatMap(t => t.rows.map(r => r.name + " " + r.desc)).join(" ")).toLowerCase();
+}
+["fv", "point"].forEach(k => Object.values(DB[k]).forEach(e => e._hay = haystack(e)));
+
+function render() {
+  const q = document.getElementById("q").value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const onlyT = document.getElementById("optT").checked;
+  const vt = document.getElementById("optV").value;
+  let es = all().filter(e => (group === "All" || e.group === group)
+    && (!onlyT || e.tutorialCount) && (!vt || e.types.includes(vt))
+    && q.every(w => e._hay.includes(w)));
+  const score = (e) => q.filter(w => e.name.toLowerCase().includes(w)).length * 3
+    + q.filter(w => (e.aliases || "").toLowerCase().includes(w)).length * 2 + Math.min(e.tutorialCount, 200) / 50;
+  es.sort((a, b) => score(b) - score(a) || a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  const ul = document.getElementById("list");
+  ul.innerHTML = es.map(e => `<li data-n="${esc(e.name)}" class="${current === e.name ? "sel" : ""}">
+    <div class="n">${esc(e.name)}${e.tutorialCount ? `<span class="badge">tutorials ${e.tutorialCount}</span>` : ""}${e.wallOnly ? '<span class="badge">wall only</span>' : e.wallFunction ? '<span class="badge">wall function</span>' : ""}${e.constraint ? '<span class="badge">constraint</span>' : ""}${e.libs.length ? '<span class="badge">libs</span>' : ""}</div>
+    <div class="s">${esc(e.group)} · ${esc(e.types.length === 5 ? "all types" : e.types.join(", "))} · ${esc(e.summary)}</div></li>`).join("");
+  document.getElementById("count").textContent = `${es.length} shown`;
+}
+
+function codeBox(text) {
+  return `<div class="codebox"><button onclick="copyCode(this)">Copy</button><pre>${esc(text)}</pre></div>`;
+}
+function copyCode(btn) {
+  const t = btn.nextElementSibling.textContent;
+  (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(
+    () => { btn.textContent = "Copied"; setTimeout(() => btn.textContent = "Copy", 1200); },
+    () => { const r = document.createRange(); r.selectNodeContents(btn.nextElementSibling);
+            const s = getSelection(); s.removeAllRanges(); s.addRange(r); });
+}
+function tableHtml(tables) {
+  return tables.map(t => `${t.heading ? `<div class="theading">${esc(t.heading)}</div>` : ""}
+    <div class="tablewrap"><table><tr><th>Property</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+    ${t.rows.map(r => `<tr class="${r.reqd === "yes" ? "req" : ""}"><td class="k">${esc(r.name)}</td><td>${esc(r.type)}</td>
+      <td>${esc(r.reqd)}</td><td>${esc(r.default || "-")}</td><td>${esc(r.desc)}</td></tr>`).join("")}</table></div>`).join("");
+}
+function counts(obj) {
+  const mx = Math.max(1, ...Object.values(obj));
+  return Object.entries(obj).map(([k, v]) => `<div><span class="bar" style="width:${Math.round(80 * v / mx)}px"></span><code>${esc(k)}</code> ${v}</div>`).join("");
+}
+
+function show(name) {
+  const e = DB[kind][name]; if (!e) return;
+  current = name;
+  document.querySelectorAll("#list li").forEach(li => li.classList.toggle("sel", li.dataset.n === name));
+  let h = `<h2>${esc(e.name)}</h2>
+    <div class="sub">${esc(e.group)} · ${esc(e.kind)}PatchField · <code>${esc(e.header)}</code> ·
+    ${e.library ? "lib" + esc(e.library) : "built into the solver"}</div>
+    <div class="kv" style="margin-top:10px">
+      <div>value types</div><div>${esc(e.types.join(", "))}</div>
+      ${e.ancestors.length ? `<div>derived from</div><div>${esc(e.ancestors.join(" → "))}</div>` : ""}
+      ${e.libs.length ? `<div>libs</div><div>tutorials add <code>libs (${esc(e.libs.join(" "))});</code> to system/controlDict</div>` : ""}
+      ${e.wallOnly ? `<div>patch</div><div class="warn">only for mesh patches of type wall (aborts otherwise)</div>` : e.wallFunction ? `<div>patch</div><div>wall function: intended for patches of type wall</div>` : ""}
+      ${e.constraint ? `<div>patch</div><div class="warn">constraint type: the mesh patch type must also be ${esc(e.name)}</div>` : ""}
+    </div>`;
+  h += `<h3>Description</h3><div class="desc">${esc(e.description || "-")}</div>`;
+  if (e.entry) h += `<h3>Ready-to-edit entry (0/&lt;field&gt; → boundaryField)</h3>${codeBox(e.entry)}`;
+  if (e.example) h += `<h3>Example (from header)</h3>${codeBox(e.example)}`;
+  if (e.otherExamples.length) h += `<details><summary>More blocks from the header (${e.otherExamples.length})</summary>${e.otherExamples.map(codeBox).join("<br>")}</details>`;
+  if (e.tables.length) h += `<h3>Parameters</h3>${tableHtml(e.tables)}`;
+  if (e.inherited.length) {
+    h += `<h3>Inherited entries</h3>`;
+    e.inherited.forEach(b => {
+      const base = DB.bases[b];
+      h += base && base.tables.length
+        ? `<details><summary>${esc(b)}</summary>${tableHtml(base.tables)}</details>`
+        : `<div><code>${esc(b)}</code></div>`;
+    });
+  }
+  if (e.note) h += `<h3>Note</h3><div class="desc">${esc(e.note)}</div>`;
+  if (e.tutorialCount) {
+    h += `<h3>Usage in the tutorials (${e.tutorialCount} patch entries)</h3>
+      <div class="roles"><div class="role"><h4>Fields</h4>${counts(e.fields)}</div>
+      ${Object.keys(e.roles).length ? `<div class="role"><h4>Patch roles (from patch names)</h4>${counts(e.roles)}</div>` : ""}</div>`;
+  }
+  h += `<h3>CLI</h3>${codeBox(`foamBC show ${e.name}${kind === "point" ? " --point" : ""}\nfoamBC example ${e.name}\nfoamBC add ${e.name} -case . -patch <patch> -field <field> --insert`)}`;
+  if (e.tutorials.length) h += `<details><summary>Tutorial files (${e.tutorials.length} shown)</summary><ul class="paths">${e.tutorials.map(t => `<li>${esc(t.replace("::", "  → patch "))}</li>`).join("")}</ul></details>`;
+  if (e.seeAlso) h += `<h3>See also</h3><div class="desc">${esc(e.seeAlso)}</div>`;
+  const main = document.getElementById("detail");
+  main.innerHTML = h; main.scrollTop = 0;
+  const hash = (kind === "point" ? "point:" : "") + name;
+  if (location.hash !== "#" + hash) history.replaceState(null, "", "#" + encodeURIComponent(hash));
+}
+
+// Typical per field
+const FIELDS = ["U", "p", "p_rgh", "k", "epsilon", "omega", "nut", "nuTilda", "T", "alphat", "alpha"];
+const sel = document.getElementById("fieldSel");
+sel.innerHTML = FIELDS.map(f => `<option>${f}</option>`).join("");
+function renderTypical() {
+  const f = sel.value;
+  const roles = ["inlet", "outlet", "wall", "atmosphere", "farfield", "symmetry", "frontBack"];
+  document.getElementById("roles").innerHTML = roles.filter(r => DB.roleStats[r] && DB.roleStats[r][f]).map(r => {
+    const st = DB.roleStats[r][f];
+    return `<div class="role"><h4>${esc(r)}</h4><table>${Object.entries(st).map(([t, n]) =>
+      `<tr><td><a data-t="${esc(t)}">${esc(t)}</a></td><td>${n}</td></tr>`).join("")}</table></div>`;
+  }).join("");
+}
+document.getElementById("roles").onclick = ev => {
+  const a = ev.target.closest("a"); if (!a || !DB.fv[a.dataset.t]) return;
+  setTab("cat"); kind = "fv"; document.getElementById("optP").checked = false; buildChips(); render(); show(a.dataset.t);
+};
+sel.onchange = renderTypical;
+document.getElementById("recipes").innerHTML = `<div class="tablewrap"><table><tr><th>Role</th><th>What it sets</th></tr>${
+  Object.entries(DB.roles || {}).map(([r, d]) => `<tr><td class="k">${esc(r)}</td><td>${esc(d)}</td></tr>`).join("")}</table></div>
+  <p class="sub">Generate the entries of every field file in <code>0/</code> for one patch, e.g.</p>
+  ${codeBox("foamBC recipe velocityInlet -case . -patch inlet --U '(10 0 0)' --I 0.05 --L 0.01\nfoamBC recipe pressureOutlet -case . -patch outlet --insert\nfoamBC check -case .")}`;
+
+function setTab(t) {
+  document.getElementById("catalog").style.display = t === "cat" ? "" : "none";
+  document.getElementById("typical").style.display = t === "cat" ? "none" : "";
+  document.getElementById("tabCat").classList.toggle("on", t === "cat");
+  document.getElementById("tabTyp").classList.toggle("on", t !== "cat");
+  if (t !== "cat") renderTypical();
+}
+document.getElementById("tabCat").onclick = () => setTab("cat");
+document.getElementById("tabTyp").onclick = () => setTab("typ");
+
+document.getElementById("list").onclick = ev => { const li = ev.target.closest("li"); if (li) show(li.dataset.n); };
+["q", "optT", "optV"].forEach(id => document.getElementById(id).addEventListener("input", render));
+document.getElementById("optP").addEventListener("input", ev => {
+  kind = ev.target.checked ? "point" : "fv"; current = null; buildChips(); render();
+});
+document.addEventListener("keydown", ev => {
+  if (ev.key === "/" && document.activeElement.id !== "q") { ev.preventDefault(); setTab("cat"); document.getElementById("q").focus(); }
+});
+buildChips(); render();
+const h0 = decodeURIComponent(location.hash.slice(1));
+if (h0) {
+  if (h0.startsWith("point:")) { kind = "point"; document.getElementById("optP").checked = true; buildChips(); render(); show(h0.slice(6)); }
+  else if (DB.fv[h0]) show(h0);
+}
+</script>
+</body>
+</html>

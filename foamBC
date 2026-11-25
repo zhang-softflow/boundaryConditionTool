@@ -1,0 +1,2357 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 foamBC contributors
+#
+# foamBC is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. See the LICENSE file for details.
+"""
+foamBC - Browse, search, generate and check OpenFOAM boundary conditions.
+
+The database is built by parsing the doxygen header comments
+(Description / Usage / \\verbatim / \\table sections) of every class that is
+registered as a finite-volume (fvPatchField) or point (pointPatchField)
+boundary condition, plus the boundaryField entries of the 0/ files found in
+the tutorials (which types are used for which fields and patch roles).
+
+Sub-commands:
+    build     Scan the sources and write the database
+    list      List boundary conditions (by group, tag or value type)
+    search    Full-text search in names and descriptions (English/Japanese)
+    show      Show description, example, parameters and tutorial usage
+    example   Print real patch entries taken from the tutorials
+    typical   Most common types for a field per patch role (from tutorials)
+    add       Generate one patch entry (print, or write into 0/<field>)
+    recipe    Generate the entries of ALL fields for one patch role
+              (velocityInlet, pressureOutlet, wall, ...)
+    check     Check the boundaryField of every field file of a case
+    html      Generate the stand-alone catalog.html
+
+Database lookup order:
+    1. $FOAMBC_DB
+    2. ${XDG_DATA_HOME:-~/.local/share}/foamBC/bcDatabase-<version>.json,
+       where <version> is the basename of $WM_PROJECT_DIR (written by 'build')
+    3. bcDatabase.json bundled next to this script
+"""
+
+import argparse
+import collections
+import difflib
+import gzip
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import date
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+TOOL_DIR = Path(__file__).resolve().parent
+BUNDLED_DB = TOOL_DIR / "bcDatabase.json"
+HTML_FILE = TOOL_DIR / "catalog.html"
+HTML_TEMPLATE = TOOL_DIR / "catalog_template.html"
+
+# Directories that only contain build artefacts or copies of headers
+SKIP_DIRS = {"lnInclude", "platforms", "Make", "build"}
+
+# Value types of the standard field types
+VALUE_TYPES = ["scalar", "vector", "sphericalTensor", "symmTensor", "tensor"]
+CAP2TYPE = {t[0].upper() + t[1:]: t for t in VALUE_TYPES}
+
+# Field class (FoamFile header) -> (kind, value type)
+CLASS_RE = re.compile(r"\bclass\s+(vol|point)(Scalar|Vector|SphericalTensor|SymmTensor|Tensor)Field\s*;")
+
+# Libraries linked by (almost) every solver: no 'libs' entry needed
+DEFAULT_LIBS = {"finiteVolume", "OpenFOAM", "meshTools"}
+
+# Registration macros
+REG_TEMPLATE_ALL = re.compile(r"\bmake(Point)?PatchFields\s*\(\s*(\w+)\s*\)")
+REG_TEMPLATE_ONE = re.compile(
+    r"\b(?:makePatchFieldType|makeTemplatePatchTypeField)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)")
+REG_CLASS = re.compile(
+    r"\b(makePatchTypeField|makeRemovablePatchTypeField|addToPatchFieldRunTimeSelection|"
+    r"addRemovableToPatchFieldRunTimeSelection|makePointPatchTypeField)"
+    r"\s*\(\s*(\w+)\s*,\s*([\w:]+)\s*\)")
+REG_NAMED = re.compile(
+    r"\baddNamedToRunTimeSelectionTable\s*\(\s*(fv|point)Patch(\w+)Field\s*,\s*(\w+)\s*,"
+    r"\s*(?:patch|dictionary|patchMapper)\s*,\s*(\w+)\s*\)")
+NAMED_TYPENAME_RE = re.compile(
+    r"defineTemplateTypeNameAndDebugWithName\s*\(\s*([\w:]+)\s*,\s*\"([^\"]+)\"", re.S)
+
+# Grouping by source location (first match of a substring wins)
+GROUP_RULES = [
+    ("src/finiteVolume/fields/fvPatchFields/constraint/", "constraint"),
+    ("src/finiteVolume/fields/fvPatchFields/basic/", "basic"),
+    ("wallFunctions", "wallFunction"),
+    ("src/atmosphericModels/", "atmospheric"),
+    ("src/optimisation/", "adjoint"),
+    ("src/thermophysicalModels/radiation/", "radiation"),
+    ("src/TurbulenceModels/", "turbulence"),
+    ("src/thermoTools/", "thermal"),
+    ("src/thermophysicalModels/", "thermal"),
+    ("src/waveModels/", "wave"),
+    ("src/phaseSystemModels/", "multiphase"),
+    ("src/transportModels/", "multiphase"),
+    ("applications/solvers/multiphase/", "multiphase"),
+    ("src/regionModels/", "regionModels"),
+    ("src/regionFaModels/", "regionModels"),
+    ("src/dynamicMesh/", "meshMotion"),
+    ("src/fvMotionSolver/", "meshMotion"),
+    ("src/OpenFOAM/fields/pointPatchFields/", "point"),
+    ("src/overset/", "overset"),
+    ("src/finiteVolume/", "derived"),
+    ("applications/", "solverSpecific"),
+]
+
+# Patch roles recognised from patch names in the tutorials
+ROLE_RULES = [
+    ("inlet", re.compile(r"inlet|intake|inflow|^in$|^in_|fuel|air$", re.I)),
+    ("outlet", re.compile(r"outlet|outflow|exhaust|^out$|^out_", re.I)),
+    ("atmosphere", re.compile(r"atmosphere|^top$|^sky$|^open", re.I)),
+    ("farfield", re.compile(r"farfield|far_field|freestream", re.I)),
+    ("symmetry", re.compile(r"sym", re.I)),
+    ("frontBack", re.compile(r"front|back|empty|defaultFaces", re.I)),
+    ("wall", re.compile(r"wall|body|obstacle|cylinder|lid|bottom|floor|ground|"
+                        r"blade|hull|aerofoil|airfoil|plate|heater|baffle", re.I)),
+]
+
+# Type-name keywords used as tags (for 'list --tag' and searching)
+TAG_RULES = [
+    ("inlet", r"inlet|inflow"), ("outlet", r"outlet|transmissive|advective"),
+    ("wall", r"wall|slip|noslip"), ("pressure", r"pressure|prgh|p0"),
+    ("velocity", r"velocity|flowrate"), ("temperature", r"temperature|heat|alphat"),
+    ("turbulence", r"turbulen|kqr|epsilon|omega|nut|nutilda"),
+    ("timeVarying", r"timevarying|uniform|table"), ("coded", r"coded|expr"),
+    ("mapped", r"mapped"), ("jump", r"jump|fan|baffle"),
+    ("coupled", r"coupled|cyclic|processor"), ("radiation", r"radiation|marshak|greygradient"),
+]
+
+# Extra search keywords (common terms, Japanese included)
+ALIASES = {
+    "fixedValue": "dirichlet constant fixed 固定値 ディリクレ 一定 値指定",
+    "zeroGradient": "neumann zero gradient 勾配ゼロ ノイマン 自然 出口 断熱",
+    "calculated": "derived nut alphat 計算値 派生",
+    "fixedGradient": "neumann gradient heat flux 勾配指定 熱流束",
+    "mixed": "robin mixed 混合 ロビン",
+    "inletOutlet": "backflow outlet reverse flow 逆流 出口 流入流出",
+    "outletInlet": "inflow reverse 逆流",
+    "noSlip": "no slip wall stationary 滑りなし 壁 静止壁 ノンスリップ",
+    "slip": "free slip frictionless wall 滑り 自由すべり 摩擦なし 壁",
+    "partialSlip": "partial slip wall 部分すべり 壁",
+    "movingWallVelocity": "moving wall mesh motion 移動壁 動く壁",
+    "rotatingWallVelocity": "rotating wall rotation 回転壁 回転",
+    "flowRateInletVelocity": "flow rate volumetric mass flow inlet 流量 体積流量 質量流量 入口",
+    "flowRateOutletVelocity": "flow rate outlet 流量 出口",
+    "surfaceNormalFixedValue": "normal velocity inlet magnitude 面法線 法線方向 流速 入口",
+    "pressureInletOutletVelocity": "open boundary atmosphere entrainment 大気開放 開放境界 圧力境界 速度",
+    "pressureInletVelocity": "pressure inlet velocity 圧力入口 速度",
+    "totalPressure": "total pressure stagnation atmosphere open 全圧 総圧 大気開放 開放 入口",
+    "prghPressure": "p_rgh static pressure hydrostatic outlet 静水圧 出口 圧力",
+    "prghTotalPressure": "p_rgh total pressure atmosphere open 全圧 大気開放",
+    "fixedFluxPressure": "p_rgh wall inlet buoyancy gradient 壁 入口 浮力 圧力",
+    "freestream": "farfield free stream external 遠方 一様流 外部流",
+    "freestreamVelocity": "farfield free stream external airfoil 遠方 一様流 外部流 翼",
+    "freestreamPressure": "farfield free stream external airfoil 遠方 一様流 外部流 翼",
+    "turbulentIntensityKineticEnergyInlet": "turbulence intensity k inlet 乱流強度 乱れ強さ 入口",
+    "turbulentMixingLengthDissipationRateInlet": "mixing length epsilon inlet 混合長 入口 散逸率",
+    "turbulentMixingLengthFrequencyInlet": "mixing length omega inlet 混合長 入口 比散逸率",
+    "kqRWallFunction": "wall function k 壁関数 乱流エネルギー",
+    "epsilonWallFunction": "wall function epsilon 壁関数",
+    "omegaWallFunction": "wall function omega 壁関数",
+    "nutkWallFunction": "wall function nut 壁関数 乱流粘性",
+    "nutUSpaldingWallFunction": "wall function nut spalding continuous 壁関数 乱流粘性 スポルディング",
+    "nutLowReWallFunction": "low reynolds wall resolved nut 低レイノルズ 壁解像",
+    "nutUWallFunction": "wall function nut 壁関数",
+    "nutkRoughWallFunction": "rough wall roughness 粗い壁 粗さ 壁関数",
+    "nutURoughWallFunction": "rough wall roughness 粗い壁 粗さ 壁関数",
+    "compressible::alphatWallFunction": "thermal wall function alphat 乱流熱拡散 壁関数",
+    "compressible::alphatJayatillekeWallFunction": "thermal wall function alphat 乱流熱拡散 壁関数",
+    "alphatJayatillekeWallFunction": "thermal wall function alphat incompressible 乱流熱拡散 壁関数",
+    "externalWallHeatFluxTemperature": "heat flux heat transfer coefficient convection ambient "
+                                       "熱流束 熱伝達率 対流 外気 断熱 発熱 壁",
+    "fixedMeanOutletInlet": "mean value outlet 平均値 出口",
+    "fixedMean": "mean value 平均値",
+    "uniformFixedValue": "time varying table Function1 時間変化 時系列 テーブル 関数",
+    "uniformInletOutlet": "time varying backflow 時間変化 逆流",
+    "timeVaryingMappedFixedValue": "mapped data measured profile time series 実測 外部データ マッピング 分布",
+    "fixedProfile": "profile distribution 分布 プロファイル",
+    "codedFixedValue": "user code custom 自作 コード プログラム",
+    "codedMixed": "user code custom 自作 コード プログラム",
+    "exprFixedValue": "expression formula 式 数式",
+    "exprMixed": "expression formula 式 数式",
+    "fan": "fan pressure jump cyclic baffle ファン 送風機 圧力上昇",
+    "fanPressure": "fan curve inlet outlet ファン 送風機 特性曲線",
+    "porousBafflePressure": "porous baffle pressure drop 多孔質 バッフル 圧損",
+    "fixedJump": "jump cyclic baffle ジャンプ",
+    "advective": "non reflecting outlet convective 無反射 非反射 出口 対流",
+    "waveTransmissive": "non reflecting acoustic outlet 無反射 非反射 音響 出口 圧縮性",
+    "symmetryPlane": "symmetry plane 対称 対称面",
+    "symmetry": "symmetry 対称",
+    "empty": "2D two dimensional 2次元",
+    "wedge": "axisymmetric 2D 軸対称",
+    "cyclic": "periodic 周期境界",
+    "cyclicAMI": "periodic sliding rotating AMI 周期 スライディング 回転",
+    "cyclicACMI": "partially overlapping AMI 部分重複",
+    "mapped": "recycling inflow mapped 周期 マッピング 再循環",
+    "MarshakRadiation": "radiation wall emissivity 輻射 放射 壁",
+    "greyDiffusiveRadiation": "radiation wall fvDOM 輻射 放射 壁",
+    "compressible::turbulentTemperatureCoupledBaffleMixed": "cht conjugate coupled solid fluid "
+                                                            "共役熱伝達 熱連成 固体 流体 連成",
+    "compressible::turbulentTemperatureRadCoupledMixed": "cht conjugate coupled radiation "
+                                                         "共役熱伝達 熱連成 固体 流体 連成 輻射",
+    "atmBoundaryLayerInletVelocity": "atmospheric boundary layer wind log profile ABL 大気境界層 風 対数則",
+    "atmBoundaryLayerInletK": "atmospheric boundary layer wind ABL 大気境界層 風",
+    "atmBoundaryLayerInletEpsilon": "atmospheric boundary layer wind ABL 大気境界層 風",
+    "atmBoundaryLayerInletOmega": "atmospheric boundary layer wind ABL 大気境界層 風",
+    "swirlFlowRateInletVelocity": "swirl flow rate 旋回 スワール 流量",
+    "cylindricalInletVelocity": "swirl cylindrical 旋回 円筒",
+    "pressureDirectedInletVelocity": "pressure inlet direction 圧力入口 方向",
+    "variableHeightFlowRate": "liquid height flow rate open channel 液面 水位 流量",
+    "variableHeightFlowRateInletVelocity": "liquid height flow rate open channel 液面 水位 流量",
+    "waveVelocity": "wave generation 波 造波",
+    "waveAlpha": "wave generation 波 造波",
+    "outletPhaseMeanVelocity": "outlet mean velocity phase 出口 平均流速",
+    "turbulentInlet": "random fluctuation inlet 乱れ 変動 入口",
+    "turbulentDFSEMInlet": "synthetic eddy LES inlet 乱流生成 LES 入口",
+    "turbulentDigitalFilterInlet": "synthetic turbulence LES inlet 乱流生成 LES 入口",
+    "fixedNormalSlip": "normal slip 法線",
+    "matchedFlowRateOutletVelocity": "flow rate outlet 流量 出口",
+    "totalTemperature": "total temperature stagnation 全温",
+    "uniformTotalPressure": "total pressure time varying 全圧 時間変化",
+    "fixedProfile ": "profile 分布",
+}
+
+SECTION_RE = re.compile(r"^([A-Z][A-Za-z ]{1,30})\s*$")
+TYPENAME_RE = re.compile(r'\bTypeName(?:NoDebug)?\s*\(\s*"([^"]+)"\s*\)')
+TYPE_ENTRY_RE = re.compile(r"^\s*type\s+([\w:.<>]+)\s*;", re.M)
+LIBS_RE = re.compile(r"^\s*libs\s*\(([^)]*)\)\s*;", re.M)
+LINK_RE = re.compile(r"\\link\s+([\w.]+)\s+\\endlink")
+PARENT_RE = re.compile(r"public\s+(?:Foam::)?(?:\w+::)?(\w+(?:FvPatch|PointPatch)\w*Field)\b")
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+def is_foam_root(path):
+    return path is not None and Path(path, "src", "OpenFOAM").is_dir()
+
+
+def project_dir(arg=None, required=True):
+    """Return the OpenFOAM source root directory (or None if not found).
+
+    Search order: explicit argument, $WM_PROJECT_DIR, two levels above this
+    script (when installed inside an OpenFOAM tree, e.g. <root>/myTools/foamBC).
+    """
+    if arg:
+        cands = [Path(arg)]
+    else:
+        cands = []
+        env = os.environ.get("WM_PROJECT_DIR")
+        if env:
+            cands.append(Path(env))
+        cands.append(TOOL_DIR.parent.parent)
+    for c_ in cands:
+        if is_foam_root(c_):
+            return c_.resolve()
+    if required:
+        sys.exit("Error: OpenFOAM source tree not found. Source the OpenFOAM "
+                 "environment (etc/bashrc) or use --src <OpenFOAM root>.")
+    return None
+
+
+def user_db_path(version):
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "foamBC" / f"bcDatabase-{version}.json"
+
+
+def current_version():
+    env = os.environ.get("WM_PROJECT_DIR")
+    return Path(env).name if env else None
+
+
+def read_text(path):
+    try:
+        path = Path(path)
+        if path.suffix == ".gz":
+            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def strip_comments(text):
+    """Remove C/C++ comments (string literals are not expected here)."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def mask_comments(text):
+    """Replace comments by blanks, keeping offsets and newlines (strings aware)."""
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            j = text.find('"', i + 1)
+            i = n if j < 0 else j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+def header_comment(text):
+    """Return the leading documentation comment block of a source file."""
+    m = re.search(r"\\\*-{5,}[-*]*\*/", text)
+    if not m:
+        return ""
+    block = text[: m.start()]
+    idx = block.find("\nClass")
+    if idx < 0:
+        idx = block.find("\nDescription")
+    return block[idx + 1:] if idx >= 0 else block
+
+
+def split_sections(comment):
+    """Split a doxygen header comment into {SectionName: text}."""
+    sections = {}
+    current = None
+    buf = []
+
+    def flush():
+        if current:
+            old = sections.get(current)
+            txt = "\n".join(buf)
+            sections[current] = old + "\n\n" + txt if old else txt
+    for line in comment.splitlines():
+        m = SECTION_RE.match(line)
+        if m and not line.startswith(" "):
+            flush()
+            current = m.group(1).strip()
+            buf = []
+        elif current:
+            buf.append(line)
+    flush()
+    return sections
+
+
+def dedent(text):
+    lines = text.splitlines()
+    ind = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+    cut = min(ind) if ind else 0
+    return "\n".join(l[cut:] for l in lines).strip("\n")
+
+
+def extract_verbatims(text):
+    """Return \\verbatim blocks; tolerate a missing \\endverbatim."""
+    out = []
+    parts = re.split(r"\\verbatim[ \t]*\n", text)
+    for part in parts[1:]:
+        end = part.find("\\endverbatim")
+        if end >= 0:
+            out.append(dedent(part[:end]))
+            continue
+        lines = part.splitlines()
+        first = next((l for l in lines if l.strip()), "")
+        ind = len(first) - len(first.lstrip())
+        blk = []
+        for l in lines:
+            blk.append(l)
+            if l.strip() == "}" and len(l) - len(l.lstrip()) == ind:
+                break
+        out.append(dedent("\n".join(blk)))
+    return out
+
+
+def clean_doxygen(text):
+    """Remove doxygen markup from prose."""
+    text = re.sub(r"\\verbatim.*?\\endverbatim", "", text, flags=re.S)
+    text = re.sub(r"\\table.*?\\endtable", "", text, flags=re.S)
+    text = re.sub(r"<!--\s*\n\s*-->", " ", text)
+    text = LINK_RE.sub(r"\1", text)
+    text = re.sub(r"\\(c|a|b|em|p)\s+", "", text)
+    text = re.sub(r"\\vartheta", "theta", text)
+    text = re.sub(r"\\(end)?vartable", "", text)
+    text = re.sub(r"\\heading\s+", "", text)
+    text = re.sub(r"\\f\[.*?\\f\]", "[formula]", text, flags=re.S)
+    text = re.sub(r"\\f\$(.*?)\\f\$", r"\1", text, flags=re.S)
+    text = text.replace("\\<", "<").replace("\\>", ">")
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return dedent(text)
+
+
+def parse_tables(text):
+    """Parse every \\table ... \\endtable block into a list of row dicts."""
+    tables = []
+    for m in re.finditer(r"(?:\\heading\s+([^\n]*)\n\s*)?\\table\s*\n(.*?)\\endtable",
+                         text, re.S):
+        heading = (m.group(1) or "").strip()
+        body = re.sub(r"<!--\s*\n\s*-->", " ", m.group(2))
+        body = body.replace("\\<", "<").replace("\\>", ">")
+        lines = [l.strip() for l in body.splitlines() if "|" in l]
+        if not lines:
+            continue
+        head = [c_.strip().lower() for c_ in lines[0].split("|")]
+        cols = {}
+        for i, h in enumerate(head):
+            if h.startswith("prop") or h in ("entry", "keyword", "name"):
+                cols.setdefault("name", i)
+            elif h.startswith("desc"):
+                cols.setdefault("desc", i)
+            elif h.startswith("type"):
+                cols.setdefault("type", i)
+            elif h.startswith("req") or h.startswith("mand"):
+                cols.setdefault("reqd", i)
+            elif h.startswith("def") or h.startswith("dflt"):
+                cols.setdefault("default", i)
+        if "name" not in cols:
+            continue
+        rows = []
+        for l in lines[1:]:
+            cells = [c_.strip() for c_ in l.split("|")]
+
+            def cell(key):
+                i = cols.get(key)
+                return cells[i] if i is not None and i < len(cells) else ""
+            name = cell("name")
+            if not name:
+                continue
+            reqd = cell("reqd").lower()
+            if reqd.startswith(("yes", "y")):
+                reqd = "yes"
+            elif reqd.startswith("no") or reqd.startswith("opt"):
+                reqd = "no"
+            elif reqd.startswith(("cnd", "cond")):
+                reqd = "cond"
+            rows.append({
+                "name": name,
+                "desc": re.sub(r"\s+", " ", LINK_RE.sub(r"\1", cell("desc"))),
+                "type": cell("type"),
+                "reqd": reqd,
+                "default": cell("default").strip("-").strip() if cell("default") != "-" else "",
+            })
+        if rows:
+            tables.append({"heading": heading, "rows": rows})
+    return tables
+
+
+def lib_from_make(path):
+    """Find the library a source belongs to via the nearest Make/files.
+
+    Returns the library name, "" for solver-local sources (EXE) or None.
+    """
+    d = Path(path).parent
+    for _ in range(10):
+        mf = d / "Make" / "files"
+        if mf.is_file():
+            txt = read_text(mf)
+            m = re.search(r"^\s*LIB\s*=\s*\$\(FOAM_\w+\)/lib(\w+)", txt, re.M)
+            if m:
+                return m.group(1)
+            if re.search(r"^\s*EXE\s*=", txt, re.M):
+                return ""
+        if d.parent == d:
+            break
+        d = d.parent
+    return None
+
+
+def find_brace_end(text, i):
+    """Return the index of the brace closing the one at text[i] (masked text)."""
+    depth = 0
+    for j in range(i, len(text)):
+        ch = text[j]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+
+ENTRY_RE = re.compile(r'\s*("[^"]*"|[^\s{};"]+)')
+
+
+def dict_entries(masked, start, end):
+    """Parse the entries of a dictionary body masked[start:end].
+
+    Yields dicts with: key, kind ('dict' | 'value' | 'directive'), start
+    (offset of the key), end (offset after the entry), body (start, end) of
+    the sub-dictionary contents for kind 'dict'.
+    """
+    i = start
+    while i < end:
+        m = ENTRY_RE.match(masked, i, end)
+        if not m:
+            break
+        key = m.group(1)
+        ks = m.start(1)
+        j = m.end()
+        if key.startswith("#"):
+            nl = masked.find("\n", j)
+            nl = end if nl < 0 or nl > end else nl
+            yield {"key": key, "kind": "directive", "start": ks, "end": nl,
+                   "text": masked[ks:nl].strip()}
+            i = nl
+            continue
+        # Skip blanks
+        while j < end and masked[j] in " \t\r\n":
+            j += 1
+        if j < end and masked[j] == "{":
+            be = find_brace_end(masked, j)
+            if be is None or be >= end:
+                break
+            yield {"key": key.strip('"'), "quoted": key.startswith('"'), "kind": "dict",
+                   "start": ks, "end": be + 1, "body": (j + 1, be)}
+            i = be + 1
+            continue
+        # Value entry up to ';' (no braces at this level)
+        semi = masked.find(";", j)
+        if key.endswith(";"):
+            yield {"key": key.rstrip(";"), "kind": "value", "start": ks, "end": m.end(),
+                   "value": ""}
+            i = m.end()
+            continue
+        if semi < 0 or semi > end:
+            break
+        yield {"key": key, "kind": "value", "start": ks, "end": semi + 1,
+               "value": masked[j:semi].strip()}
+        i = semi + 1
+
+
+def entry_type(masked, body):
+    """Return the 'type' value at depth 0 of a sub-dictionary body."""
+    for e in dict_entries(masked, body[0], body[1]):
+        if e["kind"] == "value" and e["key"] == "type":
+            return e["value"]
+    return None
+
+
+def entry_keys(masked, body):
+    return [e["key"] for e in dict_entries(masked, body[0], body[1])]
+
+
+def find_boundary_field(masked):
+    """Return (key_start, body_start, body_end) of the top-level boundaryField."""
+    for e in dict_entries(masked, 0, len(masked)):
+        if e["kind"] == "dict" and e["key"] == "boundaryField":
+            return e["start"], e["body"][0], e["body"][1]
+    return None
+
+
+def resolve_include(name, base_dir, case=None, root=None, etc=False):
+    name = name.strip().strip('"')
+    if case is not None:
+        name = name.replace("$FOAM_CASE", str(case)).replace("${FOAM_CASE}", str(case))
+    if etc:
+        for r in [root, project_dir(None, required=False)]:
+            if r and (Path(r) / "etc" / name).is_file():
+                return Path(r) / "etc" / name
+        return None
+    p = Path(name)
+    if not p.is_absolute():
+        p = Path(base_dir) / p
+    return p if p.is_file() else None
+
+
+def boundary_patches(path, text=None, case=None, depth=0):
+    """Return (patches, directives) of the boundaryField of a field file.
+
+    patches: list of dicts {key, type, keys, quoted, block} in file order;
+    entries from #include / #includeEtc files are expanded (best effort).
+    """
+    if text is None:
+        text = read_text(path)
+    masked = mask_comments(text)
+    bf = find_boundary_field(masked)
+    if not bf:
+        return None, []
+    patches, directives = [], []
+    for e in dict_entries(masked, bf[1], bf[2]):
+        if e["kind"] == "dict":
+            patches.append({
+                "key": e["key"], "quoted": e.get("quoted", False),
+                "type": entry_type(masked, e["body"]),
+                "keys": entry_keys(masked, e["body"]),
+                "block": text[text.rfind("\n", 0, e["start"]) + 1: e["end"]],
+                "unresolved": "$" in masked[e["body"][0]:e["body"][1]]
+                              or "#" in masked[e["body"][0]:e["body"][1]],
+            })
+        elif e["kind"] == "directive":
+            directives.append(e["text"])
+            m = re.match(r"#(include|includeEtc|sinclude|includeIfPresent)\s+(\S+)", e["text"])
+            if m and depth < 3:
+                inc = resolve_include(m.group(2), Path(path).parent, case,
+                                      etc=m.group(1) == "includeEtc")
+                if inc:
+                    sub = read_text(inc)
+                    # The included file holds the patch entries directly
+                    fake = "boundaryField\n{\n" + sub + "\n}\n"
+                    p2, d2 = boundary_patches(inc, fake, case, depth + 1)
+                    for p in p2 or []:
+                        p["from"] = str(inc)
+                    patches.extend(p2 or [])
+                    directives.extend(d2)
+        elif e["kind"] == "value" and e["key"].startswith("$"):
+            directives.append(e["key"])
+    return patches, directives
+
+
+# ---------------------------------------------------------------------------
+# Database build
+# ---------------------------------------------------------------------------
+
+def parse_header(hpath):
+    text = read_text(hpath)
+    comment = header_comment(text)
+    secs = split_sections(comment)
+    usage = secs.get("Usage", "")
+    desc_raw = secs.get("Description", "")
+    verbs = extract_verbatims(usage) + extract_verbatims(desc_raw)
+    tables = parse_tables(usage) + parse_tables(desc_raw)
+    verbs = [v.replace("\\<", "<").replace("\\>", ">") for v in verbs]
+    if not verbs or not tables:
+        for ext in (".C", ".cxx"):
+            src = Path(hpath).with_suffix(ext)
+            if src.is_file():
+                s2 = split_sections(header_comment(read_text(src)))
+                for key in ("Usage", "Description"):
+                    if not verbs:
+                        verbs = [v.replace("\\<", "<").replace("\\>", ">")
+                                 for v in extract_verbatims(s2.get(key, ""))]
+                    if not tables:
+                        tables = parse_tables(s2.get(key, ""))
+    inherited = [i for i in dict.fromkeys(LINK_RE.findall(usage + desc_raw))
+                 if i.endswith(".H") and i != Path(hpath).name]
+    return {
+        "text": text,
+        "description": clean_doxygen(desc_raw),
+        "verbatims": verbs,
+        "tables": tables,
+        "inherited": inherited,
+        "seeAlso": clean_doxygen(secs.get("See also", "")),
+        "note": clean_doxygen(secs.get("Note", "")),
+    }
+
+
+def pick_example(verbs, tnames):
+    """Choose the verbatim block that is a usage example of one of 'tnames'."""
+    for t in tnames:
+        pat = re.compile(r"^\s*type\s+" + re.escape(t) + r"\s*;", re.M)
+        for v in verbs:
+            if pat.search(v):
+                return v
+    for v in verbs:
+        if TYPE_ENTRY_RE.search(v) and "{" in v:
+            return v
+    for v in verbs:
+        if "{" in v:
+            return v
+    return ""
+
+
+def guess_group(rel):
+    for frag, g in GROUP_RULES:
+        if frag in rel:
+            return g
+    return "other"
+
+
+def find_class_header(directory, cls):
+    """Return the header in 'directory' declaring 'class cls'."""
+    same = directory / (cls + ".H")
+    if same.is_file():
+        return same
+    pat = re.compile(r"^\s*class\s+" + re.escape(cls) + r"\b\s*(?::|$|\n)", re.M)
+    for h in sorted(directory.glob("*.H")):
+        if pat.search(read_text(h)):
+            return h
+    # Typedef of a template: xxxFvPatchScalarField -> xxxFvPatchField.H
+    base = re.sub(r"(FvPatch|PointPatch)(Scalar|Vector|SphericalTensor|SymmTensor|Tensor)Field$",
+                  r"\1Field", cls)
+    if base != cls and (directory / (base + ".H")).is_file():
+        return directory / (base + ".H")
+    tpat = re.compile(r"\btypedef\b[^;]*\b" + re.escape(cls) + r"\s*;", re.S)
+    for h in sorted(directory.glob("*.H")):
+        if tpat.search(read_text(h)):
+            # Document the template class header, not the typedef header
+            m = re.search(r"#include\s+\"(\w+\.H)\"", read_text(h))
+            if m and (directory / m.group(1)).is_file():
+                return directory / m.group(1)
+            return h
+    return None
+
+
+def scan_registrations(root):
+    """Return {(kind, typeName): info} of registered fv/point patch fields."""
+    found = {}
+
+    def add(kind, name, header, cls, vtypes, src):
+        key = (kind, name)
+        e = found.get(key)
+        if e is None:
+            found[key] = {"kind": kind, "name": name, "header": header, "cls": cls,
+                          "types": list(vtypes), "src": src}
+        else:
+            for t in vtypes:
+                if t not in e["types"]:
+                    e["types"].append(t)
+
+    for d in ("src", "applications", "modules"):
+        if not (root / d).is_dir():
+            continue
+        for f in (root / d).rglob("*"):
+            if f.suffix not in (".C", ".cxx") or not f.is_file():
+                continue
+            rel_parts = f.relative_to(root).parts
+            if SKIP_DIRS.intersection(rel_parts):
+                continue
+            if rel_parts[:2] == ("applications", "test"):
+                continue
+            raw = read_text(f)
+            if "PatchField" not in raw and "PatchTypeField" not in raw:
+                continue
+            text = strip_comments(raw)
+            named = {m.group(1).split("::")[-1]: m.group(2)
+                     for m in NAMED_TYPENAME_RE.finditer(text)}
+            for m in REG_TEMPLATE_ALL.finditer(text):
+                kind = "point" if m.group(1) else "fv"
+                bc = m.group(2)
+                cls = bc + ("PointPatchField" if kind == "point" else "FvPatchField")
+                h = find_class_header(f.parent, cls)
+                if h is None:
+                    continue
+                names = TYPENAME_RE.findall(read_text(h))
+                add(kind, names[0] if names else bc, h, cls, VALUE_TYPES, f)
+            for m in REG_TEMPLATE_ONE.finditer(text):
+                vt, bc = m.group(1), m.group(2)
+                cls = bc + "FvPatchField"
+                h = find_class_header(f.parent, cls)
+                if h is None:
+                    continue
+                names = TYPENAME_RE.findall(read_text(h))
+                add("fv", names[0] if names else bc, h, cls, [vt], f)
+            for m in REG_CLASS.finditer(text):
+                macro, base, cls = m.groups()
+                cls = cls.split("::")[-1]
+                kind = "point" if "Point" in macro or re.search(r"[pP]ointPatch", base) else "fv"
+                mv = re.search(r"Patch(Scalar|Vector|SphericalTensor|SymmTensor|Tensor)Field$", base)
+                vt = CAP2TYPE.get(mv.group(1)) if mv else None
+                if vt is None:
+                    continue
+                h = find_class_header(f.parent, cls)
+                if h is None:
+                    continue
+                if cls in named:
+                    name = named[cls]
+                else:
+                    names = TYPENAME_RE.findall(read_text(h))
+                    if not names:
+                        continue
+                    name = names[0]
+                add(kind, name, h, cls, [vt], f)
+            # Extra names for patch-type constructors, e.g. 'overset' point fields
+            for m in REG_NAMED.finditer(text):
+                kindp, cap, cls, name = m.groups()
+                kind = "point" if kindp == "point" else "fv"
+                h = find_class_header(f.parent, cls) or find_class_header(
+                    f.parent, re.sub(r"(Scalar|Vector|SphericalTensor|SymmTensor|Tensor)Field$",
+                                     "Field", cls))
+                if h is None:
+                    hits = list(root.glob("src/**/" + re.sub(
+                        r"(Scalar|Vector|SphericalTensor|SymmTensor|Tensor)Field$", "Field", cls) + ".H"))
+                    hits = [x for x in hits if not SKIP_DIRS.intersection(x.parts)]
+                    h = hits[0] if hits else None
+                if h is None or CAP2TYPE.get(cap) is None:
+                    continue
+                add(kind, name, h, cls, [CAP2TYPE[cap]], f)
+    for e in found.values():
+        e["types"].sort(key=VALUE_TYPES.index)
+    return found
+
+
+def classify_role(patch):
+    for role, rx in ROLE_RULES:
+        if rx.search(patch):
+            return role
+    return None
+
+
+def field_category(field):
+    """Map a field name to a generic category used by the statistics."""
+    base = field.split(".")[0]
+    if field.startswith("alpha.") or field == "alpha1":
+        return "alpha"
+    return base
+
+
+def scan_tutorials(root):
+    """Scan the boundaryField of every field file in the tutorials.
+
+    Returns (uses, roleStats):
+      uses[(kind, type)] = {"refs": [(rel, patch)], "fields": Counter, "roles": Counter}
+      roleStats[role][fieldCategory][type] = count
+    """
+    uses = {}
+    role_stats = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
+    tut = root / "tutorials"
+    if not tut.is_dir():
+        return uses, {}
+    for f in sorted(tut.rglob("*")):
+        rel_parts = f.relative_to(tut).parts
+        if not any(re.match(r"^0(\.orig|\.org)?$", p) for p in rel_parts[:-1]):
+            continue
+        if not f.is_file() or f.stat().st_size > 400000 or f.suffix in (".gz",):
+            continue
+        text = read_text(f)
+        if "boundaryField" not in text:
+            continue
+        field = re.sub(r"\.orig$", "", f.name)
+        rel = str(f.relative_to(root))
+        mc = CLASS_RE.search(text[:3000])
+        if not mc:
+            continue    # finite-area or surface fields
+        kind = "point" if mc.group(1) == "point" else "fv"
+        pats, _ = boundary_patches(f, text)
+        for p in pats or []:
+            t = p["type"]
+            if not t or t.startswith("$"):
+                continue
+            u = uses.setdefault((kind, t), {"refs": [], "fields": collections.Counter(),
+                                    "roles": collections.Counter()})
+            if "from" not in p:
+                u["refs"].append((rel, p["key"]))
+            u["fields"][field_category(field)] += 1
+            role = classify_role(p["key"])
+            if role and kind == "fv":
+                u["roles"][role] += 1
+                role_stats[role][field_category(field)][t] += 1
+    rs = {r: {fc: dict(cnt.most_common(8)) for fc, cnt in d.items()}
+          for r, d in role_stats.items()}
+    return uses, rs
+
+
+def pick_refs(refs, n=30):
+    """Choose up to n references, one per case directory first."""
+    out, seen = [], set()
+    for rel, patch in refs:
+        case = rel.rsplit("/0", 1)[0]
+        if case not in seen:
+            seen.add(case)
+            out.append(f"{rel}::{patch}")
+            if len(out) >= n:
+                return out
+    for rel, patch in refs:
+        s = f"{rel}::{patch}"
+        if s not in out:
+            out.append(s)
+            if len(out) >= n:
+                break
+    return out
+
+
+def tutorial_libs(root):
+    """Map case directory -> libs listed in its system/controlDict."""
+    out = {}
+    tut = root / "tutorials"
+    for cd in tut.rglob("controlDict"):
+        if cd.parent.name != "system":
+            continue
+        m = LIBS_RE.search(strip_comments(read_text(cd)))
+        if m:
+            libs = [re.sub(r"^lib|\.so$", "", x.strip().strip('"'))
+                    for x in m.group(1).split()]
+            out[str(cd.parent.parent.relative_to(root))] = libs
+    return out
+
+
+def build_header_index(root):
+    idx = {}
+    for f in (root / "src").rglob("*.H"):
+        if SKIP_DIRS.intersection(f.relative_to(root).parts):
+            continue
+        idx.setdefault(f.name, str(f.relative_to(root)))
+    return idx
+
+
+WALL_CHECK_RE = re.compile(r"!\s*isA<wallFvPatch>\s*\(\s*patch\(\)\s*\)\s*\)\s*\{\s*FatalError", re.S)
+
+
+def wall_fatal(header):
+    """True if the class sources abort when the patch is not of type wall."""
+    stem = Path(header).with_suffix("")
+    for ext in (".C", ".cxx", ".txx"):
+        f = stem.with_suffix(ext)
+        if f.is_file() and WALL_CHECK_RE.search(strip_comments(read_text(f))):
+            return True
+    return False
+
+
+def make_tags(name, roles):
+    low = name.lower()
+    tags = [t for t, rx in TAG_RULES if re.search(rx, low)]
+    total = sum(roles.values())
+    if total >= 3:
+        for r, n in roles.items():
+            if n / total >= 0.4 and r in ("inlet", "outlet", "wall") and r not in tags:
+                tags.append(r)
+    return tags
+
+
+def cmd_build(args):
+    root = project_dir(args.src)
+    print(f"Scanning {root} ...")
+    regs = scan_registrations(root)
+    uses, role_stats = scan_tutorials(root)
+    case_libs = tutorial_libs(root)
+
+    db = {"tool": "foamBC", "version": root.name, "built": date.today().isoformat(),
+          "fv": {}, "point": {}, "bases": {}, "roleStats": role_stats}
+    cls_to_name = {}
+    for (kind, name), r in regs.items():
+        cls_to_name.setdefault(r["cls"], name)
+        # Typedef names of the templates (e.g. fixedValueFvPatchScalarField)
+        for t in r["types"]:
+            cap = t[0].upper() + t[1:]
+            cls_to_name.setdefault(r["cls"].replace("PatchField", f"Patch{cap}Field"), name)
+
+    for (kind, name), r in sorted(regs.items(), key=lambda kv: kv[0][1].lower()):
+        h = r["header"]
+        rel = str(h.relative_to(root))
+        info = parse_header(h)
+        example = pick_example(info["verbatims"], [name, name.split("::")[-1]])
+        lib = lib_from_make(r["src"])
+        parents = []
+        for p in PARENT_RE.findall(info["text"]):
+            if p != r["cls"] and p not in parents:
+                parents.append(p)
+        desc = info["description"]
+        summary = desc.split("\n\n")[0].replace("\n", " ").strip()
+        u = uses.get((kind, name), {"refs": [], "fields": collections.Counter(),
+                            "roles": collections.Counter()})
+        # libs that tutorials using this type load in controlDict
+        libs_hint = []
+        if lib and lib not in DEFAULT_LIBS:
+            for rel_t, _ in u["refs"]:
+                case = rel_t.rsplit("/0", 1)[0]
+                if lib in case_libs.get(case, []):
+                    libs_hint = [lib]
+                    break
+        group = guess_group(rel)
+        if kind == "point" and group not in ("meshMotion", "point"):
+            group = "point"
+        e = {
+            "name": name,
+            "kind": kind,
+            "class": r["cls"],
+            "types": r["types"],
+            "group": group,
+            "header": rel,
+            "library": lib if lib is not None else "",
+            "libs": libs_hint,
+            "summary": summary,
+            "description": desc,
+            "example": example,
+            "otherExamples": [v for v in info["verbatims"] if v != example][:4],
+            "tables": info["tables"],
+            "inherited": info["inherited"],
+            "parents": parents,
+            "note": info["note"],
+            "seeAlso": info["seeAlso"],
+            "aliases": ALIASES.get(name, "") if kind == "fv" else "",
+            "tutorials": pick_refs(u["refs"]),
+            "tutorialCount": len(u["refs"]),
+            "fields": dict(u["fields"].most_common(6)),
+            "roles": dict(u["roles"].most_common()),
+        }
+        e["tags"] = make_tags(name, e["roles"])
+        e["_wallFatal"] = wall_fatal(h)
+        db[kind][name] = e
+
+    # Ancestry: type names of the parent classes (transitive); parent classes
+    # that are not selectable (e.g. nutWallFunction) are followed via headers
+    hidx = build_header_index(root)
+    fatal_cache = {}
+
+    def class_info(cls):
+        if cls not in fatal_cache:
+            rel = hidx.get(cls + ".H")
+            if rel:
+                txt = read_text(root / rel)
+                fatal_cache[cls] = (wall_fatal(root / rel),
+                                    [p for p in PARENT_RE.findall(txt) if p != cls])
+            else:
+                fatal_cache[cls] = (False, [])
+        return fatal_cache[cls]
+    by_cls = {}
+    for kind in ("fv", "point"):
+        for e in db[kind].values():
+            by_cls.setdefault(e["class"], e)
+    for kind in ("fv", "point"):
+        for e in db[kind].values():
+            anc, todo, seen = [], list(e["parents"]), set()
+            while todo:
+                p = todo.pop(0)
+                if p in seen:
+                    continue
+                seen.add(p)
+                pe = by_cls.get(p)
+                if pe is None:
+                    base = re.sub(r"(FvPatch|PointPatch)(Scalar|Vector|SphericalTensor|"
+                                  r"SymmTensor|Tensor)Field$", r"\1Field", p)
+                    pe = by_cls.get(base)
+                    nm = cls_to_name.get(p) or cls_to_name.get(base)
+                else:
+                    nm = pe["name"]
+                if nm and nm not in anc and nm != e["name"]:
+                    anc.append(nm)
+                if pe:
+                    todo.extend(pe["parents"])
+                else:
+                    fat, pp = class_info(p)
+                    if fat:
+                        e["_wallFatal"] = True
+                    todo.extend(pp)
+            e["ancestors"] = anc
+            e["wallFunction"] = ("WallFunction" in e["name"] or
+                                 any("WallFunction" in a for a in anc)) and kind == "fv"
+            e["constraint"] = e["group"] == "constraint"
+    names_fatal = {e["name"] for e in db["fv"].values() if e["_wallFatal"]}
+    for kind in ("fv", "point"):
+        for e in db[kind].values():
+            e["wallOnly"] = kind == "fv" and (e["name"] in names_fatal or
+                                              any(a in names_fatal for a in e["ancestors"]))
+            del e["_wallFatal"]
+
+    # Base headers documenting inherited entries
+    wanted = list(dict.fromkeys(i for k in ("fv", "point") for e in db[k].values()
+                                for i in e["inherited"]))
+    bases = {}
+    while wanted:
+        name = wanted.pop(0)
+        if name in bases:
+            continue
+        rel = hidx.get(name)
+        if not rel:
+            continue
+        info = parse_header(root / rel)
+        bases[name] = {
+            "header": rel,
+            "summary": info["description"].split("\n\n")[0].replace("\n", " "),
+            "example": pick_example(info["verbatims"], []),
+            "tables": info["tables"],
+        }
+    db["bases"] = bases
+
+    out = Path(args.output) if args.output else user_db_path(root.name)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(db, indent=1, ensure_ascii=False), encoding="utf-8")
+
+    fv = list(db["fv"].values())
+    noex = sorted(e["name"] for e in fv if not e["example"])
+    notab = sorted(e["name"] for e in fv if not e["tables"])
+    unknown = sorted(t for k, t in uses if t not in db[k])
+    print(f"Wrote {out}")
+    if not args.output and current_version() != root.name:
+        print(f"  note: used automatically when $WM_PROJECT_DIR ends with '{root.name}';"
+              f" otherwise set FOAMBC_DB={out}")
+    print(f"  fvPatchField types   : {len(fv)}")
+    print(f"  pointPatchField types: {len(db['point'])}")
+    print(f"  with example         : {len(fv) - len(noex)}")
+    print(f"  with param table     : {len(fv) - len(notab)}")
+    print(f"  used in tutorials    : {sum(1 for e in fv if e['tutorialCount'])}")
+    print(f"  base headers         : {len(bases)}")
+    if unknown:
+        print(f"  tutorial types not in DB: {len(unknown)}"
+              + (" (" + " ".join(unknown) + ")" if args.verbose else " (-v to list)"))
+    if args.verbose:
+        print("  no example    :", " ".join(noex) or "-")
+        print("  no param table:", " ".join(notab) or "-")
+
+
+# ---------------------------------------------------------------------------
+# Query commands
+# ---------------------------------------------------------------------------
+
+def find_db():
+    env = os.environ.get("FOAMBC_DB")
+    if env:
+        if not Path(env).is_file():
+            sys.exit(f"Error: FOAMBC_DB={env} not found.")
+        return Path(env)
+    ver = current_version()
+    if ver and user_db_path(ver).is_file():
+        return user_db_path(ver)
+    return BUNDLED_DB
+
+
+_DB = None
+
+
+def load_db():
+    global _DB
+    if _DB is not None:
+        return _DB
+    path = find_db()
+    if not path.is_file():
+        sys.exit("Error: database not found. Run 'foamBC build' first.")
+    db = json.loads(path.read_text(encoding="utf-8"))
+    ver = current_version()
+    if ver and path == BUNDLED_DB and db.get("version") != ver and not os.environ.get("FOAMBC_QUIET"):
+        print(f"Warning: bundled database is for {db.get('version')}, but the "
+              f"environment is {ver}. Run 'foamBC build' for an exact match.",
+              file=sys.stderr)
+    _DB = db
+    return db
+
+
+def use_color(stream=None):
+    return (stream or sys.stdout).isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, code, stream=None):
+    return f"\033[{code}m{text}\033[0m" if use_color(stream) else text
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def kind_of(args):
+    return "point" if getattr(args, "point", False) else "fv"
+
+
+def lookup(db, name, kind="fv", exit_on_fail=True):
+    tbl = db[kind]
+    if name in tbl:
+        return tbl[name]
+    low = name.lower()
+    for k, e in tbl.items():
+        if k.lower() == low or k.split("::")[-1].lower() == low:
+            return e
+    if not exit_on_fail:
+        return None
+    close = [k for k in tbl if low in k.lower()]
+    msg = f"Error: unknown {'point' if kind == 'point' else ''} boundary condition '{name}'."
+    other = "fv" if kind == "point" else "point"
+    if name in db[other]:
+        msg += f" ('{name}' exists as a {other} patch field: " + \
+               ("use --point)" if other == "point" else "drop --point)")
+    if close:
+        msg += " Did you mean: " + ", ".join(sorted(close, key=len)[:10]) + " ?"
+    sys.exit(msg)
+
+
+def type_abbrev(types):
+    if types == VALUE_TYPES:
+        return "all"
+    ab = {"scalar": "S", "vector": "V", "sphericalTensor": "sT", "symmTensor": "sym",
+          "tensor": "T"}
+    return ",".join(ab[t] for t in types)
+
+
+def print_rows(entries):
+    w = max([len(e["name"]) for e in entries] + [4])
+    for e in entries:
+        flag = "T" if e["tutorialCount"] else " "
+        flag += "W" if e["wallOnly"] else ("w" if e.get("wallFunction") else
+                                           ("C" if e["constraint"] else " "))
+        s = e["summary"]
+        if len(s) > 70:
+            s = s[:67] + "..."
+        print(f"{c(e['name'].ljust(w), '1;36')}  {flag}  {type_abbrev(e['types']):<9} "
+              f"{e['group']:<13} {s}")
+
+
+def legend():
+    return ("T: used in tutorials, W: wall patches only (w: wall function), C: constraint type "
+            "(must match the mesh patch type); value types S=scalar V=vector ...")
+
+
+def cmd_list(args):
+    db = load_db()
+    es = list(db[kind_of(args)].values())
+    if args.group:
+        es = [e for e in es if args.group.lower() in e["group"].lower()]
+    if args.tag:
+        es = [e for e in es if args.tag in e["tags"]]
+    if args.type:
+        es = [e for e in es if args.type in e["types"]]
+    if args.used:
+        es = [e for e in es if e["tutorialCount"]]
+        es.sort(key=lambda e: -e["tutorialCount"])
+    if args.groups:
+        cnt = collections.Counter(e["group"] for e in es)
+        for g, n in sorted(cnt.items()):
+            print(f"{g:<16}{n}")
+        return
+    print_rows(es)
+    print(f"\n{len(es)} entries  ({legend()})")
+
+
+def cmd_search(args):
+    db = load_db()
+    words = [w.lower() for w in args.keywords]
+    hits = []
+    for e in db[kind_of(args)].values():
+        names = e["name"].lower()
+        hay = " ".join([names, e["description"], e["header"], e.get("aliases", ""),
+                        " ".join(e["tags"]), " ".join(e["fields"]),
+                        " ".join(r["name"] for t in e["tables"] for r in t["rows"])]).lower()
+        if all(w in hay for w in words):
+            score = sum(3 for w in words if w in names) + \
+                sum(1 for w in words if w in e["summary"].lower()) + \
+                sum(2 for w in words if w in e.get("aliases", "").lower()) + \
+                min(e["tutorialCount"], 200) / 50.0
+            hits.append((-score, e["name"].lower(), e))
+    if not hits:
+        print("No match. Try English keywords or 'foamBC list'.")
+        return
+    print_rows([h[2] for h in sorted(hits)][: args.max])
+    if len(hits) > args.max:
+        print(f"... {len(hits) - args.max} more (use -m)")
+
+
+def format_tables(tables, only_required=False):
+    out = []
+    for t in tables:
+        rows = [r for r in t["rows"] if not only_required or r["reqd"] == "yes"]
+        if not rows:
+            continue
+        if t["heading"]:
+            out.append(c(f"  [{t['heading']}]", "1"))
+        wn = max(len(r["name"]) for r in rows)
+        wt = max([len(r["type"]) for r in rows] + [4])
+        out.append(f"  {'Property'.ljust(wn)}  {'Type'.ljust(wt)}  Reqd  Default        Description")
+        for r in rows:
+            name = r["name"].ljust(wn)
+            if r["reqd"] == "yes":
+                name = c(name, "1;31")
+            elif r["reqd"] == "cond":
+                name = c(name, "1;35")
+            out.append(f"  {name}  {r['type'].ljust(wt)}  {r['reqd'][:4]:<4}  "
+                       f"{(r['default'] or '-')[:13]:<13}  {r['desc']}")
+    return "\n".join(out)
+
+
+def cmd_show(args):
+    db = load_db()
+    e = lookup(db, args.name, kind_of(args))
+    print(c(f"=== {e['name']} ===", "1;36") + f"   ({e['group']}, {e['kind']}PatchField)")
+    print(f"Types  : {', '.join(e['types'])}")
+    print(f"Header : {e['header']}")
+    print(f"Library: lib{e['library']}" if e["library"] else
+          "Library: (built into the solver)")
+    if e["libs"]:
+        print(f"libs   : ({' '.join(e['libs'])})   <- tutorials load it in system/controlDict")
+    if e["ancestors"]:
+        print(f"Derived from: {' -> '.join(e['ancestors'][:6])}")
+    if e["wallOnly"]:
+        print(c("Patch  : wall patches only (aborts if the mesh patch type is not 'wall')", "1;31"))
+    elif e.get("wallFunction"):
+        print(c("Patch  : wall function, intended for patches of type 'wall'", "1;33"))
+    if e["constraint"]:
+        print(c(f"Patch  : constraint type, the mesh patch type must also be "
+                f"'{e['name']}'", "1;31"))
+    print()
+    print(c("Description", "1;33"))
+    print("\n".join("  " + l for l in (e["description"] or "-").splitlines()))
+    print()
+    print(c("Example (from header)", "1;33"))
+    print("\n".join("  " + l for l in (e["example"] or "(none)").splitlines()))
+    if args.more and e["otherExamples"]:
+        for v in e["otherExamples"]:
+            print()
+            print("\n".join("  " + l for l in v.splitlines()))
+    elif e["otherExamples"]:
+        print(f"  (+{len(e['otherExamples'])} more block(s) in the header: use --more)")
+    print()
+    if e["tables"]:
+        print(c("Parameters", "1;33") + "  (red = mandatory, magenta = conditional)")
+        print(format_tables(e["tables"]))
+        print()
+    if e["inherited"]:
+        print(c("Inherited entries documented in", "1;33") + ": " + ", ".join(e["inherited"]))
+        if args.inherited:
+            for h in e["inherited"]:
+                b = db["bases"].get(h)
+                if b and b["tables"]:
+                    print(c(f"  --- {h} ---", "1"))
+                    print(format_tables(b["tables"]))
+        else:
+            print("  (use --inherited to show them)")
+        print()
+    if e["note"]:
+        print(c("Note", "1;33"))
+        print("\n".join("  " + l for l in e["note"].splitlines()))
+        print()
+    if e["tutorialCount"]:
+        n = e["tutorialCount"]
+        fl = ", ".join(f"{k} ({v})" for k, v in e["fields"].items())
+        rl = ", ".join(f"{k} ({v})" for k, v in e["roles"].items())
+        print(c(f"Used in tutorials ({n} patch entries)", "1;33") +
+              f"  -> foamBC example {e['name']}")
+        print(f"  fields: {fl}")
+        if rl:
+            print(f"  patch roles (from patch names): {rl}")
+        for t in e["tutorials"][: args.max]:
+            print("  " + t)
+        if len(e["tutorials"]) > args.max:
+            print(f"  ... (use -m to list more)")
+
+
+def cmd_example(args):
+    db = load_db()
+    e = lookup(db, args.name, kind_of(args))
+    root = project_dir(args.src, required=False)
+    refs = e["tutorials"]
+    if args.field:
+        refs = [r for r in refs if field_category(Path(r.split("::")[0]).name.replace(".orig", ""))
+                == field_category(args.field)] or refs
+    if not refs:
+        print(f"'{e['name']}' is not used in the tutorials. Header example:\n")
+        print(e["example"])
+        return
+    if root is None:
+        print("OpenFOAM tutorials not found (source the OpenFOAM environment or use "
+              "--src). Patch entries using it:")
+        for r in refs[: args.max * 3]:
+            print("  " + r)
+        return
+    shown = 0
+    for ref in refs:
+        rel, patch = ref.split("::", 1)
+        pats, _ = boundary_patches(root / rel)
+        for p in pats or []:
+            if p["key"] == patch and p["type"] == e["name"]:
+                print(c(f"// ---- {rel}  (patch {patch})", "1;32"))
+                print(dedent(p["block"]))
+                print()
+                shown += 1
+                break
+        if shown >= args.max:
+            break
+    print(f"(showed {shown}; {e['tutorialCount']} patch entries use it, use -m to show more, "
+          f"--field to choose the field)")
+
+
+def cmd_typical(args):
+    db = load_db()
+    rs = db.get("roleStats", {})
+    cat = field_category(args.field)
+    roles = [args.role] if args.role else ["inlet", "outlet", "wall", "atmosphere",
+                                           "farfield", "symmetry", "frontBack"]
+    print(c(f"Most common boundary conditions for '{args.field}' in the tutorials "
+            f"(patch role guessed from the patch name)", "1"))
+    for r in roles:
+        stats = rs.get(r, {}).get(cat)
+        if not stats:
+            continue
+        tot = sum(stats.values())
+        print(c(f"  {r}", "1;33") + f"  ({tot} patches)")
+        for t, n in list(stats.items())[: args.max]:
+            print(f"    {t:<44} {n:>5}")
+    print("\nDetails: foamBC show <type>, foamBC example <type> --field " + args.field)
+
+
+# ---------------------------------------------------------------------------
+# Entry generation
+# ---------------------------------------------------------------------------
+
+def mandatory_lines(example):
+    """Return one-line mandatory entries at depth 1 of a base-class example."""
+    out = []
+    section = "mandatory"
+    depth = 0
+    for l in example.splitlines():
+        s = l.strip()
+        low = s.lower()
+        if depth == 1 and low.startswith("//"):
+            if "optional" in low and "mandatory/optional" not in low or "conditional" in low:
+                section = "optional"
+            elif "mandatory/optional" in low:
+                section = "other"
+            elif "mandatory" in low:
+                section = "mandatory"
+        elif depth == 1 and section == "mandatory" and re.match(r"^\w+\s+[^{]*;", s) \
+                and not s.startswith("type"):
+            out.append(s)
+        depth += s.count("{") - s.count("}") if not s.startswith("//") else 0
+    return out
+
+
+def add_base_entries(e, text, bases):
+    """Insert the mandatory entries documented in the inherited headers."""
+    if not bases:
+        return text
+    live = strip_comments(text)
+    for b in e["inherited"]:
+        # Entries of a parent boundary condition (e.g. inletValue of
+        # inletOutlet) are usually set by the derived class itself
+        if b not in bases or re.search(r"(Fv|Point)Patch\w*Fields?\.H$", b):
+            continue
+        req = {r["name"] for t in bases[b]["tables"] for r in t["rows"] if r["reqd"] == "yes"}
+        add = [l for l in mandatory_lines(bases[b].get("example", ""))
+               if l.split()[0] in req and
+               not re.search(r"^\s*" + re.escape(l.split()[0]) + r"\s", live, re.M)]
+        if add:
+            block = f"\n    // Mandatory entries from {b}\n" + "".join(f"    {l}\n" for l in add)
+            text = re.sub(r"(^\s*type\s+[\w:.<>]+\s*;[^\n]*\n)", lambda m: m.group(1) + block,
+                          text, count=1, flags=re.M)
+            live = strip_comments(text)
+    return text
+
+
+def build_entry(e, patch, mode="minimal", bases=None):
+    """Create a patch entry from the header example."""
+    ex = e["example"]
+    if not ex or not TYPE_ENTRY_RE.search(ex):
+        ex = "{0}\n{{\n    type            {1};\n}}".format(patch, e["name"])
+    lines = ex.splitlines()
+    for i, l in enumerate(lines):
+        if l.strip() and not l.strip().startswith("//"):
+            if re.match(r"^[\w<>.\-\"()|*]+$", l.strip()):
+                lines[i] = patch
+            break
+    for i, l in enumerate(lines):
+        m = TYPE_ENTRY_RE.match(l)
+        if m:
+            lines[i] = l.replace(m.group(1), e["name"], 1)
+            break
+    required = {r["name"] for t in e["tables"] for r in t["rows"] if r["reqd"] == "yes"}
+    first = next((i for i, l in enumerate(lines) if l.strip() == "{"), None)
+    last = max((i for i, l in enumerate(lines) if l.strip() == "}"), default=None)
+    has_markers = any(l.strip().startswith("//") and "mandatory" in l.lower() for l in lines)
+    out = []
+    section = "mandatory"
+    depth = 0
+    for i, l in enumerate(lines):
+        s = l.strip()
+        low = s.lower()
+        if depth <= 1 and low.startswith("//"):
+            if "conditional" in low:
+                section = "conditional"
+            elif "optional" in low:
+                section = "optional"
+            elif "inherited" in low:
+                section = "inherited"
+            elif "mandatory" in low:
+                section = "mandatory"
+        nopen = s.count("{") - s.count("}") if not s.startswith("//") else 0
+        if s in ("...", "// ..."):
+            depth += nopen
+            continue
+        key = re.match(r"^([\w\-]+)\s", s + " ")
+        is_req = depth == 1 and bool(key) and key.group(1) in required
+        outer = first is None or i <= first or i == last
+        keep_inherited = section == "inherited" and bool(key) and key.group(1) == "value"
+        if outer or section == "mandatory" or is_req or keep_inherited or depth > 1:
+            if depth > 1 and section not in ("mandatory",) and not is_req and mode != "full":
+                depth += nopen
+                continue
+            out.append(l)
+        elif mode == "full":
+            if s and not s.startswith("//"):
+                out.append(re.sub(r"^(\s*)", r"\1// ", l, count=1))
+            else:
+                out.append(l)
+        depth += nopen
+    clean = []
+    for l in out:
+        if not l.strip() and clean and not clean[-1].strip():
+            continue
+        clean.append(l)
+    if mode != "full":
+        clean = [l for j, l in enumerate(clean)
+                 if not (l.strip().startswith("//") and
+                         (j + 1 >= len(clean) or not clean[j + 1].strip()
+                          or clean[j + 1].strip() == "}"))]
+    out = [l for j, l in enumerate(clean)
+           if not (not l.strip() and j + 1 < len(clean) and clean[j + 1].strip() == "}")]
+    text = add_base_entries(e, "\n".join(out), bases)
+    if mode == "full":
+        present = set(re.findall(r"^\s*(?://\s*)?(\w+)\s", text, re.M))
+        extra = [r for t in e["tables"] for r in t["rows"]
+                 if r["name"] not in present and re.match(r"^\w+$", r["name"])]
+        if extra:
+            add = ["", "    // Further entries documented in the header:"]
+            for r in extra:
+                d = f" (default: {r['default']})" if r["default"] else ""
+                add.append(f"    // {r['name']:<16} <{r['type'] or 'value'}>;  "
+                           f"// {r['desc']}{d}")
+            idx = text.rfind("}")
+            text = text[:idx].rstrip("\n") + "\n" + "\n".join(add) + "\n" + text[idx:]
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Case handling
+# ---------------------------------------------------------------------------
+
+CONSTRAINT_PATCH_TYPES = {"empty", "wedge", "symmetryPlane", "symmetry", "cyclic",
+                          "cyclicAMI", "cyclicACMI", "cyclicSlip", "processor",
+                          "processorCyclic", "nonuniformTransformCyclic", "overset"}
+
+
+def mesh_patches(case, region=None):
+    """Return {name: {"type", "groups"}} from constant/polyMesh/boundary."""
+    for fn in ("boundary", "boundary.gz"):
+        p = case / "constant" / (region or "") / "polyMesh" / fn
+        if p.is_file():
+            masked = mask_comments(read_text(p))
+            # Skip the FoamFile header
+            m = re.search(r"^\s*\d+\s*\n\s*\(", masked, re.M) or re.search(r"^\s*\(", masked, re.M)
+            start = m.end() if m else 0
+            out = {}
+            for e in dict_entries(masked, start, len(masked)):
+                if e["kind"] != "dict" or e["key"] == "FoamFile":
+                    continue
+                body = masked[e["body"][0]:e["body"][1]]
+                t = re.search(r"\btype\s+(\w+)\s*;", body)
+                g = re.search(r"\binGroups\s+(?:List<word>\s*)?\d*\s*\(([^)]*)\)", body)
+                out[e["key"]] = {"type": t.group(1) if t else "patch",
+                                 "groups": g.group(1).split() if g else []}
+            return out
+    return None
+
+
+NONUNIFORM = {}
+
+
+def field_dir(case, region=None, time=None):
+    if time:
+        return case / time / (region or "")
+    for t in ("0", "0.orig"):
+        d = case / t / (region or "")
+        if d.is_dir():
+            return d
+    return case / "0" / (region or "")
+
+
+def case_fields(fdir):
+    """Return {field: (path, kind, valueType, dimensions)} of the field files."""
+    out = {}
+    if not fdir.is_dir():
+        return out
+    for p in sorted(fdir.iterdir()):
+        if not p.is_file() or p.name.startswith(".") or p.name.endswith((".bak", "~")):
+            continue
+        head = read_text(p)[:3000]
+        m = CLASS_RE.search(head)
+        if not m:
+            continue
+        dims = re.search(r"^\s*dimensions\s+\[([^\]]*)\]", read_text(p), re.M)
+        name = re.sub(r"\.orig$", "", p.name)
+        NONUNIFORM[str(p)] = bool(re.search(r"^\s*internalField\s+nonuniform", read_text(p), re.M))
+        out[name] = (p, "point" if m.group(1) == "point" else "fv",
+                     CAP2TYPE[m.group(2)], dims.group(1).split() if dims else None)
+    return out
+
+
+def match_patch(patches, name, groups):
+    """Return the boundaryField entry applying to a mesh patch (OpenFOAM rules:
+    exact name, then regular expressions (last first), then patch groups)."""
+    for p in patches:
+        if not p["quoted"] and p["key"] == name:
+            return p
+    for p in patches:
+        if p["quoted"] and p["key"] == name:
+            return p
+    for p in reversed(patches):
+        if p["quoted"]:
+            try:
+                if re.fullmatch(p["key"], name):
+                    return p
+            except re.error:
+                pass
+    for g in groups:
+        for p in patches:
+            if p["key"] == g:
+                return p
+    return None
+
+
+def indent_block(text, n=4):
+    return "\n".join((" " * n + l) if l.strip() else "" for l in text.splitlines())
+
+
+def write_patch_entry(path, patch, entry, dry=False):
+    """Replace or append the entry of 'patch' in the boundaryField of a field file."""
+    text = read_text(path)
+    masked = mask_comments(text)
+    bf = find_boundary_field(masked)
+    if not bf:
+        return False, "no boundaryField"
+    target = None
+    shadowed = []
+    for e in dict_entries(masked, bf[1], bf[2]):
+        if e["kind"] == "dict" and e["key"] == patch:
+            target = e
+        elif e["kind"] == "dict" and e.get("quoted"):
+            try:
+                if re.fullmatch(e["key"], patch):
+                    shadowed.append(e["key"])
+            except re.error:
+                pass
+    new = indent_block(entry)
+    if target:
+        ls = text.rfind("\n", 0, target["start"]) + 1
+        text2 = text[:ls] + new + text[target["end"]:]
+        action = "replaced"
+    else:
+        # Before the closing brace of boundaryField
+        close = bf[2]
+        ls = text.rfind("\n", 0, close) + 1
+        prev = text[:ls].rstrip("\n")
+        text2 = prev + "\n\n" + new + "\n" + text[ls:]
+        action = "appended"
+        if shadowed:
+            action += f" (overrides the regex entry \"{shadowed[-1]}\" for this patch)"
+    if not dry:
+        bak = path.with_name(path.name + ".bak")
+        if not bak.exists():
+            shutil.copy2(path, bak)
+        path.write_text(text2, encoding="utf-8")
+    return True, action
+
+
+def case_or_exit(args):
+    case = Path(args.case).resolve()
+    if not (case / "system").is_dir() and not (case / "constant").is_dir():
+        sys.exit(f"Error: {case} does not look like a case directory (use -case)")
+    return case
+
+
+def cmd_add(args):
+    db = load_db()
+    e = lookup(db, args.name, kind_of(args))
+    patch = args.patch or "<patchName>"
+    text = build_entry(e, patch, "full" if args.full else "minimal", db.get("bases"))
+    vt_field = None
+    if args.field:
+        cf0 = case_fields(field_dir(Path(args.case).resolve(), args.region, args.time))
+        if args.field in cf0:
+            vt_field = cf0[args.field][2]
+    if vt_field == "vector":
+        text = re.sub(r"\buniform 0\b(\s*;)", r"uniform (0 0 0)\1", text)
+        text = text.replace("  // Example for scalar field usage", "")
+    stamp = date.today().isoformat()
+    print(f"// Generated by foamBC from {e['header']} ({stamp})")
+    print(text)
+    placeholders = sorted(set(re.findall(r"<[\w ,:/|.\-]+>", strip_comments(text))))
+    case = Path(args.case).resolve()
+    if (case / "constant").is_dir() or (case / "system").is_dir():
+        mp = mesh_patches(case, args.region) or {}
+        if args.patch and mp:
+            if args.patch not in mp:
+                eprint(c(f"Warning: patch '{args.patch}' not in the mesh "
+                         f"({' '.join(mp)})", "1;31", sys.stderr))
+            else:
+                for msg in compat_issues(e, mp[args.patch]["type"], None) + \
+                        compat_warnings(e, mp[args.patch]["type"]):
+                    eprint(c("Warning: " + msg, "1;31", sys.stderr))
+        elif mp and not args.patch:
+            eprint("mesh patches: " + " ".join(f"{k}({v['type']})" for k, v in mp.items()))
+        if args.field:
+            fdir = field_dir(case, args.region, args.time)
+            fields = case_fields(fdir)
+            if args.field not in fields:
+                eprint(c(f"Warning: field file {fdir / args.field} not found", "1;31", sys.stderr))
+            else:
+                fpath, fkind, vt, _ = fields[args.field]
+                if vt not in e["types"]:
+                    eprint(c(f"Error: '{e['name']}' is not available for {vt} fields "
+                             f"(types: {', '.join(e['types'])})", "1;31", sys.stderr))
+                    sys.exit(1)
+                if args.insert:
+                    if not args.patch:
+                        sys.exit("Error: --insert needs -patch")
+                    ok, act = write_patch_entry(fpath, args.patch, text)
+                    if not ok:
+                        sys.exit(f"Error: {fpath}: {act}")
+                    eprint(f"{act} patch '{args.patch}' in {fpath} (backup: {fpath.name}.bak)")
+    elif args.insert:
+        sys.exit(f"Error: {case} does not look like a case directory (use -case)")
+    if args.insert and not args.field:
+        sys.exit("Error: --insert needs -field")
+    if e["libs"]:
+        eprint(f"Note: add  libs ({' '.join(e['libs'])});  to system/controlDict "
+               f"unless the solver already links it")
+    if placeholders:
+        eprint(c("Edit these placeholders before running: ", "1;31", sys.stderr) +
+               " ".join(placeholders))
+
+
+# ---------------------------------------------------------------------------
+# Checking
+# ---------------------------------------------------------------------------
+
+def compat_issues(e, ptype, vtype):
+    """Return a list of messages about using BC e on a mesh patch of type ptype."""
+    msgs = []
+    if vtype and vtype not in e["types"]:
+        msgs.append(f"'{e['name']}' does not exist for {vtype} fields "
+                    f"(available: {', '.join(e['types'])})")
+    if not ptype:
+        return msgs
+    chain = [e["name"]] + e.get("ancestors", [])
+    if ptype in CONSTRAINT_PATCH_TYPES:
+        if ptype not in chain and not (ptype == "processor" and "processorCyclic" in chain):
+            msgs.append(f"mesh patch type is '{ptype}': the boundary condition must be "
+                        f"'{ptype}' (or derived from it), not '{e['name']}'")
+    elif e["constraint"] and e["name"] not in ("calculatedProcessor",):
+        msgs.append(f"'{e['name']}' is a constraint type; the mesh patch type must be "
+                    f"'{e['name']}' but it is '{ptype}'")
+    if e["wallOnly"] and ptype and ptype != "wall":
+        msgs.append(f"'{e['name']}' aborts unless the mesh patch type is 'wall' "
+                    f"(this patch is '{ptype}')")
+    return msgs
+
+
+def compat_warnings(e, ptype):
+    if e.get("wallFunction") and not e["wallOnly"] and ptype and ptype != "wall":
+        return [f"'{e['name']}' is a wall function intended for patches of type 'wall' "
+                f"(this patch is '{ptype}')"]
+    return []
+
+
+def missing_required(e, keys, db):
+    if not e["tables"]:
+        return []
+    req = []
+    for t in e["tables"]:
+        for r in t["rows"]:
+            if r["reqd"] == "yes" and re.match(r"^\w+$", r["name"]) and r["name"] != "type":
+                req.append(r["name"])
+    return [k for k in dict.fromkeys(req) if k not in keys]
+
+
+def cmd_check(args):
+    db = load_db()
+    case = case_or_exit(args)
+    mp = mesh_patches(case, args.region)
+    fdir = field_dir(case, args.region, args.time)
+    fields = case_fields(fdir)
+    if args.fields:
+        want = args.fields.replace(",", " ").split()
+        fields = {k: v for k, v in fields.items() if k in want}
+    if not fields:
+        sys.exit(f"Error: no field files found in {fdir}")
+    if mp is None:
+        eprint(c("Note: constant/polyMesh/boundary not found (run blockMesh first); "
+                 "patch names are taken from the field files and patch types are unknown.",
+                 "1;33", sys.stderr))
+    errors, warnings = [], []
+    table = collections.OrderedDict()
+    for fname, (fpath, fkind, vt, dims) in fields.items():
+        pats, directives = boundary_patches(fpath, case=case)
+        if pats is None:
+            warnings.append(f"{fname}: no boundaryField")
+            continue
+        uses_constraint_include = any("setConstraintTypes" in d for d in directives)
+        has_unresolved = any(d.startswith("$") or d.startswith("#include") for d in directives)
+        names = mp if mp is not None else {p["key"]: {"type": "?", "groups": []}
+                                           for p in pats if not p["quoted"]}
+        for pname, pinfo in names.items():
+            ptype = pinfo["type"]
+            p = match_patch(pats, pname, pinfo["groups"] + [ptype])
+            cell = table.setdefault(pname, {})
+            if p is None:
+                if uses_constraint_include and ptype in CONSTRAINT_PATCH_TYPES:
+                    cell[fname] = ptype + "*"
+                    continue
+                cell[fname] = c("MISSING", "1;31")
+                (warnings if has_unresolved else errors).append(
+                    f"{fname}: no entry for patch '{pname}' ({ptype})"
+                    + (" - maybe defined via $/#include" if has_unresolved else ""))
+                continue
+            t = p["type"]
+            cell[fname] = t or "?"
+            if not t:
+                if p["unresolved"]:
+                    cell[fname] = "($macro)"
+                else:
+                    errors.append(f"{fname}/{pname}: entry '{p['key']}' has no 'type'")
+                continue
+            e = lookup(db, t, fkind, exit_on_fail=False)
+            if e is None:
+                other = lookup(db, t, "fv" if fkind == "point" else "point", exit_on_fail=False)
+                short = t.split("::")[-1]
+                close = [short] if short != t and short in db[fkind] else \
+                    difflib.get_close_matches(t, list(db[fkind]), n=1, cutoff=0.8)
+                hint = f" (did you mean '{close[0]}'?)" if close else ""
+                if other:
+                    hint = f" ('{t}' is a {'point' if fkind == 'fv' else 'fv'} patch field)"
+                errors.append(f"{fname}/{pname}: unknown {fkind} boundary condition '{t}'"
+                              + (hint or " (not in OpenFOAM; a user library loaded via 'libs'?)"))
+                cell[fname] = c(t + "?", "1;31")
+                continue
+            for msg in compat_issues(e, ptype if mp is not None else None, vt):
+                errors.append(f"{fname}/{pname}: {msg}")
+                cell[fname] = c(t + "!", "1;31")
+            for msg in compat_warnings(e, ptype if mp is not None else None):
+                warnings.append(f"{fname}/{pname}: {msg}")
+            if not p["unresolved"]:
+                miss = missing_required(e, p["keys"], db)
+                if miss:
+                    warnings.append(f"{fname}/{pname}: '{t}' - header lists as required: "
+                                    f"{', '.join(miss)} (check: foamBC show {t})")
+        if mp is not None:
+            for p in pats:
+                if not p["quoted"] and p["key"] not in mp and \
+                        not any(p["key"] in v["groups"] or p["key"] == v["type"]
+                                for v in mp.values()) and "from" not in p:
+                    warnings.append(f"{fname}: entry '{p['key']}' matches no mesh patch")
+    # Patch x field table (vertical layout when it is too wide)
+    fl = list(fields)
+    wp = max([len(p) for p in table] + [5])
+    try:
+        shown_dir = fdir.relative_to(case)
+    except ValueError:
+        shown_dir = fdir
+    print(c(f"Case {case}  (fields from {shown_dir})", "1"))
+    plain = lambda v: re.sub(r"\033\[[\d;]*m", "", v)
+    widths = {f: max([len(f)] + [len(plain(r.get(f, "-"))) for r in table.values()]) for f in fl}
+    total = wp + 16 + sum(w + 2 for w in widths.values())
+    cols = shutil.get_terminal_size((160, 20)).columns
+    if total <= cols:
+        print(f"{'patch'.ljust(wp)}  {'meshType':<14}" + "".join(f"  {f.ljust(widths[f])}" for f in fl))
+        for pname, row in table.items():
+            ptype = mp[pname]["type"] if mp is not None else "?"
+            cells = "".join("  " + row.get(f, "-") + " " * (widths[f] - len(plain(row.get(f, "-"))))
+                            for f in fl)
+            print(f"{c(pname.ljust(wp), '1;36')}  {ptype:<14}{cells}")
+    else:
+        for pname, row in table.items():
+            ptype = mp[pname]["type"] if mp is not None else "?"
+            print(f"{c(pname, '1;36')}  ({ptype})")
+            for f in fl:
+                if f in row:
+                    print(f"    {f:<14} {row[f]}")
+    print()
+    for m in errors:
+        print(c("ERROR   ", "1;31") + m)
+    for m in warnings:
+        print(c("WARNING ", "1;33") + m)
+    if not errors and not warnings:
+        print(c("OK: every patch has a valid boundary condition in every field.", "1;32"))
+    print(f"\n{len(errors)} error(s), {len(warnings)} warning(s)."
+          + ("  (* = set by #includeEtc caseDicts/setConstraintTypes)" if
+             any("*" in v for r in table.values() for v in r.values()) else ""))
+    sys.exit(1 if errors else 0)
+
+
+# ---------------------------------------------------------------------------
+# Recipes: all fields of one patch role
+# ---------------------------------------------------------------------------
+
+ROLES = collections.OrderedDict([
+    ("velocityInlet", "fixed velocity inlet (--U vector or normal speed); turbulence from "
+                      "intensity --I and mixing length --L"),
+    ("flowRateInlet", "inlet with volumetric (--Q m3/s) or mass (--mdot kg/s) flow rate"),
+    ("pressureOutlet", "fixed static pressure outlet (--p), backflow-safe (inletOutlet)"),
+    ("totalPressureInlet", "inlet with fixed total pressure (--p0), velocity from the flux"),
+    ("openAtmosphere", "open boundary to the ambient (total pressure --p0, in- and outflow), "
+                       "e.g. 'atmosphere' of interFoam"),
+    ("farfield", "free-stream boundary of external flows (--U, --p)"),
+    ("wall", "stationary no-slip wall with wall functions (--Tw fixes the temperature)"),
+    ("movingWall", "wall moving tangentially with velocity --U (lid-driven cavity)"),
+    ("slipWall", "frictionless wall (slip)"),
+    ("symmetry", "constraint types: the type of the mesh patch is used for every field "
+                 "(symmetryPlane, symmetry, empty, wedge, cyclic, ...)"),
+])
+
+ROLE_ALIASES = {
+    "inlet": "velocityInlet", "velocity": "velocityInlet", "flowrate": "flowRateInlet",
+    "massflowinlet": "flowRateInlet", "outlet": "pressureOutlet", "atmosphere": "openAtmosphere",
+    "open": "openAtmosphere", "opening": "openAtmosphere", "totalpressure": "totalPressureInlet",
+    "freestream": "farfield", "noslip": "wall", "lid": "movingWall", "slip": "slipWall",
+    "constraint": "symmetry", "symmetryplane": "symmetry", "empty": "symmetry",
+    "wedge": "symmetry", "cyclic": "symmetry",
+}
+
+TURB_FIELDS = {"k", "epsilon", "omega", "nut", "nuTilda", "alphat", "kl", "kt",
+               "v2", "f", "ReThetat", "gammaInt", "R", "nuSgs", "muSgs", "alphaSgs"}
+
+
+class Ctx:
+    """Case-wide settings used by the recipes."""
+
+    def __init__(self, fields, args):
+        self.fields = fields                       # {name: valueType}
+        self.dims = {}
+        self.prgh = "p_rgh" in fields
+        self.args = args
+        self.compressible = False
+        self.notes = []
+        self.internal = {}       # uniform internalField values
+
+    def set_dims(self, name, dims):
+        self.dims[name] = dims
+        if name == "p" and dims and dims[0] in ("1", "1.0"):
+            self.compressible = True
+
+    def val(self, attr, placeholder):
+        v = getattr(self.args, attr, None)
+        return v if v not in (None, "") else placeholder
+
+    @property
+    def p_ambient(self):
+        if self.args.p:
+            return self.args.p
+        if self.compressible:
+            # Default to the initial pressure of the case
+            return self.internal.get("p", "1e5")
+        return "0"
+
+
+def is_vector_value(s):
+    return s.strip().startswith("(")
+
+
+def fmt_vec(s):
+    s = s.strip()
+    if s.startswith("("):
+        return " ".join(s.split())
+    parts = s.replace(",", " ").split()
+    return "(" + " ".join(parts) + ")" if len(parts) == 3 else s
+
+
+def entry(patch, lines, comment=None):
+    body = "\n".join("    " + (f"{k:<15} {v};" if v is not None else k)
+                     for k, v in lines)
+    head = f"// {comment}\n" if comment else ""
+    return f"{head}{patch}\n{{\n{body}\n}}"
+
+
+def recipe_entry(role, field, vt, ctx, patch, ptype=None):
+    """Return (lines, comment) for one field of a recipe, or None to skip."""
+    a = ctx.args
+    cat = field_category(field)
+    I = ctx.val("I", "0.05")
+    L = ctx.val("L", "<mixingLength [m], e.g. 0.07*hydraulicDiameter>")
+    if role == "symmetry":
+        t = ptype if ptype in CONSTRAINT_PATCH_TYPES else ctx.val("ctype", "symmetryPlane")
+        return [("type", t)], None
+
+    is_wall = role in ("wall", "movingWall", "slipWall")
+    # --- pressure -------------------------------------------------------------
+    if field == "p" and ctx.prgh:
+        return [("type", "calculated"), ("value", "$internalField")], \
+            "p is calculated from p_rgh"
+    if field in ("p", "p_rgh"):
+        prgh = field == "p_rgh"
+        if role in ("velocityInlet", "flowRateInlet") or is_wall:
+            if prgh:
+                return [("type", "fixedFluxPressure"), ("value", "$internalField")], None
+            return [("type", "zeroGradient")], None
+        if role == "pressureOutlet":
+            p = ctx.p_ambient
+            if prgh:
+                return [("type", "prghPressure"), ("p", f"uniform {p}"),
+                        ("value", "$internalField")], "static pressure p (not p_rgh) at the outlet"
+            return [("type", "fixedValue"), ("value", f"uniform {p}")], None
+        if role in ("totalPressureInlet", "openAtmosphere"):
+            p0 = ctx.val("p0", ctx.p_ambient if role == "openAtmosphere" else "<p0>")
+            if prgh:
+                return [("type", "prghTotalPressure"), ("p0", f"uniform {p0}"),
+                        ("value", "$internalField")], "total pressure p0 (of p, not p_rgh)"
+            return [("type", "totalPressure"), ("p0", f"uniform {p0}"),
+                    ("value", "$internalField")], None
+        if role == "farfield":
+            return [("type", "freestreamPressure"),
+                    ("freestreamValue", f"uniform {ctx.p_ambient}")], None
+    # --- velocity -------------------------------------------------------------
+    if cat == "U" and vt == "vector":
+        U = ctx.val("U", "<(Ux Uy Uz)>")
+        if role == "velocityInlet":
+            if a.U and not is_vector_value(a.U) and len(a.U.replace(",", " ").split()) == 1:
+                return [("type", "surfaceNormalFixedValue"), ("refValue", f"uniform -{a.U.lstrip('-')}"),
+                        ("value", "$internalField")], \
+                    "normal inflow speed (negative = into the domain)"
+            return [("type", "fixedValue"), ("value", f"uniform {fmt_vec(U)}")], None
+        if role == "flowRateInlet":
+            if a.mdot:
+                if ctx.compressible and not a.rhoInlet:
+                    return [("type", "flowRateInletVelocity"), ("massFlowRate", a.mdot),
+                            ("value", "uniform (0 0 0)")], "massFlowRate [kg/s], uses the rho field"
+                return [("type", "flowRateInletVelocity"), ("massFlowRate", a.mdot),
+                        ("rhoInlet", ctx.val("rhoInlet", "<rho [kg/m3]>")),
+                        ("value", "uniform (0 0 0)")], \
+                    "massFlowRate [kg/s]; rhoInlet is used when there is no rho field"
+            return [("type", "flowRateInletVelocity"),
+                    ("volumetricFlowRate", ctx.val("Q", "<Q [m3/s]>")),
+                    ("value", "uniform (0 0 0)")], \
+                "volumetricFlowRate [m3/s]"
+        if role == "pressureOutlet":
+            return [("type", "inletOutlet"), ("inletValue", "uniform (0 0 0)"),
+                    ("value", "$internalField")], "zeroGradient for outflow, 0 for backflow"
+        if role in ("totalPressureInlet", "openAtmosphere"):
+            return [("type", "pressureInletOutletVelocity"), ("value", "uniform (0 0 0)")], None
+        if role == "farfield":
+            return [("type", "freestreamVelocity"), ("freestreamValue", f"uniform {fmt_vec(U)}")], None
+        if role == "wall":
+            return [("type", "noSlip")], None
+        if role == "movingWall":
+            return [("type", "fixedValue"), ("value", f"uniform {fmt_vec(U)}")], \
+                "tangential wall velocity (use movingWallVelocity for moving meshes)"
+        if role == "slipWall":
+            return [("type", "slip")], None
+    # --- turbulence -----------------------------------------------------------
+    inflow = role in ("velocityInlet", "flowRateInlet")
+    backflow = role in ("pressureOutlet", "totalPressureInlet", "openAtmosphere")
+    if cat == "k":
+        if inflow:
+            return [("type", "turbulentIntensityKineticEnergyInlet"), ("intensity", I),
+                    ("value", "$internalField")], "k from the turbulence intensity"
+        if is_wall and role != "slipWall":
+            return [("type", "kqRWallFunction"), ("value", "$internalField")], None
+    if cat == "epsilon":
+        if inflow:
+            return [("type", "turbulentMixingLengthDissipationRateInlet"),
+                    ("mixingLength", L), ("value", "$internalField")], None
+        if is_wall and role != "slipWall":
+            return [("type", "epsilonWallFunction"), ("value", "$internalField")], None
+    if cat == "omega":
+        if inflow:
+            return [("type", "turbulentMixingLengthFrequencyInlet"),
+                    ("mixingLength", L), ("value", "$internalField")], None
+        if is_wall and role != "slipWall":
+            return [("type", "omegaWallFunction"), ("value", "$internalField")], None
+    if cat == "nut":
+        if is_wall and role != "slipWall":
+            wf = "nutUSpaldingWallFunction" if "nuTilda" in ctx.fields else "nutkWallFunction"
+            return [("type", wf), ("value", "uniform 0")], None
+        return [("type", "calculated"), ("value", "uniform 0")], None
+    if cat == "alphat":
+        if is_wall and role != "slipWall":
+            if ctx.compressible:
+                return [("type", "compressible::alphatWallFunction"), ("Prt", "0.85"),
+                        ("value", "uniform 0")], None
+            return [("type", "alphatJayatillekeWallFunction"), ("Prt", "0.85"),
+                    ("value", "uniform 0")], None
+        return [("type", "calculated"), ("value", "uniform 0")], None
+    if cat == "nuTilda" and is_wall and role != "slipWall":
+        return [("type", "fixedValue"), ("value", "uniform 0")], None
+    # --- temperature ----------------------------------------------------------
+    if cat == "T" and vt == "scalar":
+        if inflow:
+            return [("type", "fixedValue"), ("value", f"uniform {ctx.val('T', '<T_inlet [K]>')}")], None
+        if is_wall and role != "slipWall":
+            if a.Tw:
+                return [("type", "fixedValue"), ("value", f"uniform {a.Tw}")], None
+            return [("type", "zeroGradient")], "adiabatic wall (--Tw for a fixed temperature)"
+        if backflow:
+            return [("type", "inletOutlet"),
+                    ("inletValue", f"uniform {ctx.val('T', '<T_ambient [K]>')}"),
+                    ("value", "$internalField")], None
+        if role == "farfield":
+            return [("type", "inletOutlet"),
+                    ("inletValue", f"uniform {ctx.val('T', '$internalField')}".replace("uniform $", "$")),
+                    ("value", "$internalField")], None
+    # --- phase fraction -------------------------------------------------------
+    if cat == "alpha" and vt == "scalar":
+        if inflow:
+            return [("type", "fixedValue"), ("value", f"uniform {ctx.val('alpha', '<alpha_inlet 0..1>')}")], None
+        if backflow or role == "farfield":
+            return [("type", "inletOutlet"), ("inletValue", f"uniform {ctx.val('alpha', '0')}"),
+                    ("value", "$internalField")], "phase fraction entering through backflow"
+        if is_wall:
+            return [("type", "zeroGradient")], None
+    # --- generic --------------------------------------------------------------
+    zero = "uniform (0 0 0)" if vt == "vector" else "uniform 0"
+    if inflow:
+        return [("type", "fixedValue"), ("value", "$internalField")], \
+            f"inlet value of {field} (set it, $internalField = initial value)"
+    if backflow or role == "farfield":
+        return [("type", "inletOutlet"), ("inletValue", "$internalField"),
+                ("value", "$internalField")], None
+    if role == "slipWall":
+        return [("type", "slip")], None
+    if is_wall:
+        if cat in TURB_FIELDS:
+            ctx.notes.append(f"{field}: no standard wall function known; check the "
+                             f"turbulence model documentation")
+        return [("type", "zeroGradient")], None
+    return [("type", "zeroGradient")], None
+
+
+def cmd_recipe(args):
+    if args.list or not args.role:
+        print(c("Patch roles", "1"))
+        for r, d in ROLES.items():
+            print(f"  {c(r.ljust(20), '1;36')} {d}")
+        print("\nExample: foamBC recipe velocityInlet -case . -patch inlet --U '(10 0 0)' --I 0.05 --L 0.01")
+        return
+    role = args.role
+    if role not in ROLES:
+        role = ROLE_ALIASES.get(role.lower().replace("_", ""), role)
+    if role not in ROLES:
+        sys.exit(f"Error: unknown role '{args.role}'. Roles: {', '.join(ROLES)}")
+    db = load_db()
+    case = Path(args.case).resolve()
+    have_case = (case / "system").is_dir() or (case / "constant").is_dir()
+    fdir = field_dir(case, args.region, args.time) if have_case else None
+    cf = case_fields(fdir) if fdir else {}
+    if args.fields:
+        want = args.fields.replace(",", " ").split()
+        guess = {"U": "vector"}
+        fields = collections.OrderedDict(
+            (f, cf[f][2] if f in cf else guess.get(field_category(f), "scalar")) for f in want)
+    elif cf:
+        fields = collections.OrderedDict((k, v[2]) for k, v in cf.items() if v[1] == "fv")
+    else:
+        sys.exit("Error: no case field files found; give the fields with --fields "
+                 "(e.g. --fields U,p,k,epsilon,nut)")
+    ctx = Ctx(fields, args)
+    for k, v in cf.items():
+        ctx.set_dims(k, v[3])
+        m = re.search(r"^\s*internalField\s+uniform\s+([^;]+);", read_text(v[0]), re.M)
+        if m:
+            ctx.internal[k] = m.group(1).strip()
+    if args.compressible:
+        ctx.compressible = True
+    patch = args.patch or "<patchName>"
+    ptype = None
+    mp = mesh_patches(case, args.region) if have_case else None
+    if mp and args.patch:
+        if args.patch not in mp:
+            eprint(c(f"Warning: patch '{args.patch}' not in the mesh ({' '.join(mp)})",
+                     "1;31", sys.stderr))
+        else:
+            ptype = mp[args.patch]["type"]
+    if ptype in CONSTRAINT_PATCH_TYPES and role != "symmetry":
+        eprint(c(f"Note: mesh patch '{patch}' is of constraint type '{ptype}': "
+                 f"using role 'symmetry' (type {ptype} for all fields)", "1;33", sys.stderr))
+        role = "symmetry"
+    if role in ("wall", "movingWall") and ptype and ptype != "wall":
+        eprint(c(f"Warning: mesh patch '{patch}' is of type '{ptype}', wall functions need "
+                 f"type 'wall' (change it in blockMeshDict/constant/polyMesh/boundary)",
+                 "1;31", sys.stderr))
+    if role == "symmetry" and ptype is None and not args.ctype:
+        eprint("Note: mesh patch type unknown; using symmetryPlane (set --ctype)")
+
+    blocks = []
+    rs = db.get("roleStats", {})
+    stat_role = {"velocityInlet": "inlet", "flowRateInlet": "inlet", "pressureOutlet": "outlet",
+                 "totalPressureInlet": "inlet", "openAtmosphere": "atmosphere",
+                 "farfield": "farfield", "wall": "wall", "movingWall": "wall",
+                 "slipWall": "wall", "symmetry": "symmetry"}[role]
+    for f, vt in fields.items():
+        res = recipe_entry(role, f, vt, ctx, patch, ptype)
+        if res is None:
+            continue
+        lines, comment = res
+        t = lines[0][1]
+        if f in cf and NONUNIFORM.get(str(cf[f][0])):
+            # '$internalField' would expand to a list of the size of the mesh
+            zero = "uniform (0 0 0)" if vt == "vector" else "uniform 0"
+            fixed = []
+            for k, v in lines:
+                if v == "$internalField":
+                    v = zero if k == "value" else f"<{k} of {f}: uniform ...>"
+                fixed.append((k, v))
+            lines = fixed
+            ctx.notes.append(f"{f}: internalField is nonuniform, '$internalField' replaced")
+        top = rs.get(stat_role, {}).get(field_category(f), {})
+        most = None
+        if role != "symmetry" and top:
+            best = next(iter(top))
+            if best != t and top[best] > 2 * top.get(t, 0):
+                most = f"most used in tutorials: {best} ({top[best]}x)"
+        e = lookup(db, t, "fv", exit_on_fail=False)
+        if e is None:
+            ctx.notes.append(f"{f}: type '{t}' not found in the database of {db['version']}")
+        elif vt not in e["types"]:
+            ctx.notes.append(f"{f}: type '{t}' is not available for {vt} fields")
+        n = rs.get(stat_role, {}).get(field_category(f), {}).get(t) if role != "symmetry" else None
+        ev = f"tutorials: {n}x on {stat_role} patches" if n else None
+        cm = "; ".join(x for x in (comment, ev, most) if x)
+        blocks.append((f, vt, entry(patch, lines), cm))
+
+    print(c(f"// Recipe '{role}' for patch '{patch}'"
+            + (f" (mesh type {ptype})" if ptype else ""), "1"))
+    for f, vt, text, cm in blocks:
+        print(c(f"// ---- {(fdir.name + '/') if fdir else '0/'}{f}" + (f"   ({cm})" if cm else ""),
+                "1;32"))
+        print(text)
+        print()
+    placeholders = sorted(set(p for _, _, t, _ in blocks
+                              for p in re.findall(r"<[^<>\n]+>", t)))
+    for n in dict.fromkeys(ctx.notes):
+        eprint(c("Note: " + n, "1;33", sys.stderr))
+    if args.insert:
+        if not have_case:
+            sys.exit("Error: --insert needs a case directory (-case)")
+        if not args.patch:
+            sys.exit("Error: --insert needs -patch")
+        if placeholders:
+            sys.exit(c("Error: fill these values first (options --U --p --p0 --T --L ...): ",
+                       "1;31", sys.stderr) + " ".join(placeholders))
+        for f, vt, text, _ in blocks:
+            if f not in cf:
+                eprint(f"skip {f}: no file {fdir / f}")
+                continue
+            ok, act = write_patch_entry(cf[f][0], args.patch, text)
+            eprint(f"{f:<12} {act}" if ok else f"{f:<12} ERROR {act}")
+        eprint(f"Backups: <field>.bak in {fdir}. Check with: foamBC check -case {args.case}")
+    elif placeholders:
+        eprint(c("Values to fill (or pass --U --p --p0 --T --Tw --I --L --Q --mdot --alpha): ",
+                 "1;31", sys.stderr) + " ".join(placeholders))
+    elif have_case and args.patch:
+        eprint(f"(use --insert to write these entries into {fdir})")
+
+
+# ---------------------------------------------------------------------------
+# HTML catalog
+# ---------------------------------------------------------------------------
+
+def cmd_html(args):
+    db = load_db()
+    if not HTML_TEMPLATE.is_file():
+        sys.exit(f"Error: template {HTML_TEMPLATE} not found")
+    for e in db["fv"].values():
+        e["entry"] = build_entry(e, "<patchName>", "minimal", db.get("bases"))
+    for e in db["point"].values():
+        e["entry"] = build_entry(e, "<patchName>", "minimal", db.get("bases"))
+    db["roles"] = ROLES
+    data = json.dumps(db, ensure_ascii=False).replace("</", "<\\/")
+    page = read_text(HTML_TEMPLATE).replace("/*__BC_DATA__*/null", data)
+    out = Path(args.output) if args.output else HTML_FILE
+    out.write_text(page, encoding="utf-8")
+    print(f"Wrote {out}")
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="foamBC", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def case_opts(s):
+        s.add_argument("-case", "--case", default=".", help="case directory (default: cwd)")
+        s.add_argument("-region", "--region", help="region name (multi-region cases)")
+        s.add_argument("-time", "--time", help="field directory (default: 0, else 0.orig)")
+
+    s = sub.add_parser("build", help="scan OpenFOAM sources and build the database")
+    s.add_argument("--src", help="OpenFOAM source root (default: $WM_PROJECT_DIR)")
+    s.add_argument("-o", "--output",
+                   help="database file (default: ~/.local/share/foamBC/bcDatabase-<version>.json)")
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.set_defaults(func=cmd_build)
+
+    s = sub.add_parser("list", help="list boundary conditions")
+    s.add_argument("-g", "--group", help="filter by group (basic, constraint, derived, "
+                                         "wallFunction, turbulence, thermal, ...)")
+    s.add_argument("-t", "--tag", help="filter by tag (inlet, outlet, wall, pressure, ...)")
+    s.add_argument("--type", help="value type (scalar, vector, symmTensor, ...)")
+    s.add_argument("-u", "--used", action="store_true", help="only types used in the tutorials, "
+                                                             "most used first")
+    s.add_argument("--groups", action="store_true", help="list groups with counts")
+    s.add_argument("--point", action="store_true", help="point patch fields (mesh motion)")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("search", help="search names/descriptions (all keywords must match)")
+    s.add_argument("keywords", nargs="+")
+    s.add_argument("-m", "--max", type=int, default=25)
+    s.add_argument("--point", action="store_true")
+    s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("show", help="show documentation of a boundary condition")
+    s.add_argument("name")
+    s.add_argument("-i", "--inherited", action="store_true", help="also show inherited entries")
+    s.add_argument("--more", action="store_true", help="show additional header examples")
+    s.add_argument("-m", "--max", type=int, default=6, help="max tutorial paths to list")
+    s.add_argument("--point", action="store_true")
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("example", help="print patch entries taken from the tutorials")
+    s.add_argument("name")
+    s.add_argument("-m", "--max", type=int, default=3)
+    s.add_argument("-f", "--field", help="prefer examples of this field (U, p, k, ...)")
+    s.add_argument("--src", help="OpenFOAM source root (default: $WM_PROJECT_DIR)")
+    s.add_argument("--point", action="store_true")
+    s.set_defaults(func=cmd_example)
+
+    s = sub.add_parser("typical", help="most common types of a field per patch role")
+    s.add_argument("field", help="field name, e.g. U, p, p_rgh, k, epsilon, omega, nut, T, alpha.water")
+    s.add_argument("-r", "--role", help="inlet, outlet, wall, atmosphere, farfield, symmetry")
+    s.add_argument("-m", "--max", type=int, default=6)
+    s.set_defaults(func=cmd_typical)
+
+    s = sub.add_parser("add", help="generate one patch entry (print, or write with --insert)")
+    s.add_argument("name", help="boundary condition type, e.g. inletOutlet")
+    case_opts(s)
+    s.add_argument("-patch", "--patch", help="patch name")
+    s.add_argument("-field", "--field", help="field file name in 0/, e.g. U")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--minimal", action="store_true", help="mandatory entries only (default)")
+    g.add_argument("--full", action="store_true", help="also list optional entries as comments")
+    s.add_argument("--insert", action="store_true",
+                   help="replace/append the patch entry in 0/<field> (backup .bak)")
+    s.add_argument("--point", action="store_true")
+    s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("recipe", help="entries of all fields for a patch role "
+                                      "(velocityInlet, pressureOutlet, wall, ...)")
+    s.add_argument("role", nargs="?", help="patch role (omit or --list to list them)")
+    case_opts(s)
+    s.add_argument("-patch", "--patch", help="patch name")
+    s.add_argument("--fields", help="field names when there is no case, e.g. U,p,k,epsilon,nut")
+    s.add_argument("--list", action="store_true", help="list the roles")
+    s.add_argument("--U", help="velocity: vector '(10 0 0)' or normal inflow speed '10'")
+    s.add_argument("--p", help="static/ambient pressure in the units of the p field")
+    s.add_argument("--p0", help="total pressure (totalPressureInlet, openAtmosphere)")
+    s.add_argument("--T", help="inlet / ambient temperature [K]")
+    s.add_argument("--Tw", help="wall temperature [K] (default: adiabatic)")
+    s.add_argument("--I", help="turbulence intensity (default 0.05)")
+    s.add_argument("--L", help="turbulent mixing length [m]")
+    s.add_argument("--Q", help="volumetric flow rate [m3/s] (flowRateInlet)")
+    s.add_argument("--mdot", help="mass flow rate [kg/s] (flowRateInlet)")
+    s.add_argument("--rhoInlet", help="density for --mdot if rho is not a field")
+    s.add_argument("--alpha", help="phase fraction at the inlet (VoF)")
+    s.add_argument("--ctype", help="constraint type for role symmetry when the mesh is unknown")
+    s.add_argument("--compressible", action="store_true",
+                   help="pressure in Pa (detected from the dimensions of 0/p)")
+    s.add_argument("--insert", action="store_true",
+                   help="write the entries into every field file (backup .bak)")
+    s.set_defaults(func=cmd_recipe)
+
+    s = sub.add_parser("check", help="check the boundary conditions of a case")
+    case_opts(s)
+    s.add_argument("--fields", help="only these fields (comma separated)")
+    s.set_defaults(func=cmd_check)
+
+    s = sub.add_parser("html", help="generate catalog.html")
+    s.add_argument("-o", "--output")
+    s.set_defaults(func=cmd_html)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
